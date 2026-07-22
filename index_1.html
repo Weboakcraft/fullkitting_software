@@ -427,7 +427,7 @@ window.API = (function () {
 
   return {
     ping: function () { return get('ping'); },
-    bootstrap: function () { return get('bootstrap'); },
+    bootstrap: function () { return get('bootstrap').then(function (data) { if (data) { Object.keys(data).forEach(function (k) { var arr = data[k]; if (Array.isArray(arr)) { arr.forEach(function (rec) { if (rec && typeof rec === 'object') { var low = {}; Object.keys(rec).forEach(function (key) { low[String(key).toLowerCase().replace(/\s+/g, ' ').trim()] = rec[key]; }); var want = ['Order ID','Specification ID','Chair Type','Chair Category','Item Pic','SKU','Model No','Fabric File & Code','Handle Type','Ordered Qty','Order Status','Material Code','Material Name','Category','Available Qty','Unit','Min Stock Level','Location','Last Updated','BOM ID','Sub Category','Model No / SKU','Raw Material Code','Raw Material Name','Qty Per Unit','Remarks','Created At']; want.forEach(function (w) { var lk = w.toLowerCase(); var alt = lk.replace('ordered','ordred'); if (rec[w] === undefined || rec[w] === '') { if (low[lk] !== undefined) rec[w] = low[lk]; else if (low[alt] !== undefined) rec[w] = low[alt]; } }); } }); } }); } return data; }); },
     // orders
     createOrder: function (o) { return post('createOrder', o); },
     updateOrder: function (o) { return post('updateOrder', o); },
