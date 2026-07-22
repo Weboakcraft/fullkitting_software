@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Oakcraft — Kitting Management System</title>
+  <link rel="stylesheet" href="css/styles.css" />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#129521;</text></svg>" />
+  <!-- Libraries (CDN) -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+</head>
+<body>
+
+  <div class="loading-overlay" id="loading">
+    <div class="spinner"></div>
+    <div class="muted small" id="loadingMsg">Connecting to Google Sheets…</div>
+  </div>
+
+  <div class="app">
+    <!-- ============ SIDEBAR ============ -->
+    <aside class="sidebar" id="sidebar">
+      <div class="brand">
+        <div class="logo">🪑 Oakcraft</div>
+        <div class="tag">Kitting Management System</div>
+      </div>
+      <nav class="nav" id="nav">
+        <button data-view="dashboard"><span class="icon">📊</span> Dashboard</button>
+        <button data-view="orders"><span class="icon">🧾</span> Order Form <span class="count" id="cnt-orders">0</span></button>
+        <button data-view="bom"><span class="icon">🧩</span> Kitting Master <span class="count" id="cnt-bom">0</span></button>
+        <button data-view="fg"><span class="icon">🏭</span> FG Status</button>
+        <button data-view="inventory"><span class="icon">📦</span> Live Inventory <span class="count" id="cnt-inv">0</span></button>
+        <button data-view="kitting"><span class="icon">✅</span> Full Kitting Status</button>
+        <button data-view="pr"><span class="icon">🛒</span> Purchase Requirements <span class="count" id="cnt-pr">0</span></button>
+        <button data-view="reports"><span class="icon">📈</span> Reports</button>
+        <button data-view="settings"><span class="icon">⚙️</span> Settings</button>
+      </nav>
+      <div class="foot">v1.0 · Google Sheets backend</div>
+    </aside>
+
+    <!-- ============ MAIN ============ -->
+    <div class="main">
+      <div class="topbar">
+        <button class="btn btn-icon hamburger" id="hamburger">☰</button>
+        <h1 id="viewTitle">Dashboard</h1>
+        <div class="spacer"></div>
+        <div class="searchbox"><input id="globalSearch" type="search" placeholder="Search orders, materials, products…" /></div>
+        <span class="sync" id="syncInfo">—</span>
+        <button class="btn btn-icon" id="refreshBtn" title="Refresh from Google Sheets">⟳</button>
+        <button class="btn btn-icon" id="themeBtn" title="Toggle dark mode">🌙</button>
+      </div>
+      <div class="content" id="content"></div>
+    </div>
+  </div>
+
+  <div id="modalRoot"></div>
+  <div id="toasts"></div>
+
+  <!-- App scripts (order matters) -->
+  <script src="js/config.js"></script>
+  <script src="js/api.js"></script>
+  <script src="js/utils.js"></script>
+  <script src="js/engine.js"></script>
+  <script src="js/views.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
