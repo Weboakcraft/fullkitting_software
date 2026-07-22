@@ -297,7 +297,7 @@ table.tbl { width: 100%; border-collapse: collapse; font-size: 13px; }
 </style>
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#129521;</text></svg>" />
   <!-- Libraries (CDN) -->
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
@@ -368,8 +368,14 @@ window.KMS_CONFIG = {
   COMPANY_NAME: 'Oakcraft Furniture',
   COMPANY_TAGLINE: 'Kitting Management System',
 
-  // Dropdown option lists (edit freely)
-  CATEGORIES: ['Chair', 'Sofa', 'Wardrobe (Almirah)', 'Recliner Chair', 'Recliner Sofa', 'Bed', 'Table', 'Other'],
+  // FALLBACK dropdown lists — used only until the Masters sheet loads.
+  // The REAL lists come live from the "Masters" tab of your Google Sheet:
+  // add a value in any Masters column and it appears in the app automatically.
+  CHAIR_CATEGORIES: ['KBC', 'HIGH BACK CHAIR', 'MEDIUM BACK CHAIR', 'MESH CHAIR W', 'MESH CHAIR G', 'BOOM BLACK', 'ROBO WHITE', 'POLO WHITE', '898 CHAIR', '805 CHAIR', '802 CHAIR', 'NAG NAGIN', 'MATRIX HIGH BACK BLACK', '15 NO CHAIR', 'SPINAL HB1', 'SPINAL HB2', 'SPINAL HB3', 'KBC CHAIR'],
+  SUB_CATEGORIES: ['Chair', 'Sofa', 'Wardrobe (Almirah)', 'Recliner Chair', 'Recliner Sofa', 'Bed', 'Table', 'Other'],
+  CHAIR_TYPES: ['CUSTOMIZED PRODUCT', 'EXISTING PRODUCT'],
+  HANDLE_TYPES: ['FIXED HANDLE', 'U TYPE HANDLE', 'OLA HANDLE', 'BAR STOOL', 'WORKSTATION', '0'],
+  FABRICS: ['LEATHER', 'LEATHER BLACK', 'MESH', 'BLACK MESH', 'BROWN', 'BLACK'],
   UNITS: ['PCS', 'MTR', 'KG', 'SET', 'PAIR', 'ROLL', 'LTR', 'SQFT', 'BOX'],
   ORDER_STATUSES: ['Open', 'In Production', 'Ready', 'Dispatched', 'Delivered', 'Cancelled'],
   PRIORITIES: ['Low', 'Normal', 'High', 'Urgent'],
@@ -426,6 +432,7 @@ window.API = (function () {
     createOrder: function (o) { return post('createOrder', o); },
     updateOrder: function (o) { return post('updateOrder', o); },
     deleteOrder: function (id) { return post('deleteOrder', { orderId: id }); },
+    deleteOrderRow: function (row) { return post('deleteOrder', { row: row }); },
     // BOM
     saveBomItems: function (items) { return post('saveBomItems', { items: items }); },
     updateBomItem: function (item) { return post('updateBomItem', item); },
@@ -618,10 +625,27 @@ window.U = (function () {
    - FG requirement calculation   (order × BOM)
    - Full-kitting status          (requirement vs live stock)
    - Shortage lists               (for Purchase Requirements)
+   Matching rule: an order line is matched to the Kitting Master
+   ('Model No / SKU' column) by trying, in this priority:
+     1. order SKU   2. order Model No   3. order Chair Category
    ============================================================ */
 window.ENGINE = (function () {
 
   function n(v) { var x = Number(v); return isNaN(x) ? 0 : x; }
+  function norm(v) { return String(v == null ? '' : v).trim().toLowerCase(); }
+
+  /** The key used to find this order line's BOM. */
+  function orderKeys(order) {
+    return [order['SKU'], order['Model No'], order['Chair Category']]
+      .map(norm).filter(function (k) { return k !== ''; });
+  }
+
+  /** Human label for the ordered product (for tables, PDFs, reports). */
+  function orderLabel(order) {
+    return String(order['Model No'] || order['SKU'] || order['Chair Category'] || '').trim() || '—';
+  }
+
+  function orderQty(order) { return n(order['Ordered Qty']); }
 
   /** Map of Material Code -> inventory row */
   function inventoryMap(inventory) {
@@ -632,24 +656,35 @@ window.ENGINE = (function () {
     return map;
   }
 
-  /** BOM lines for one product (matched by Product Name, case-insensitive). */
-  function bomForProduct(bom, productName) {
-    var key = String(productName || '').trim().toLowerCase();
+  /** BOM lines for one product key ('Model No / SKU' column, case-insensitive). */
+  function bomForKey(bom, key) {
+    var k = norm(key);
     return (bom || []).filter(function (b) {
-      return String(b['Product Name'] || '').trim().toLowerCase() === key;
+      return norm(b['Model No / SKU']) === k;
     });
   }
 
+  /** BOM lines for an order line: first key (SKU → Model No → Chair Category) that has a BOM wins. */
+  function bomForOrder(bom, order) {
+    var keys = orderKeys(order);
+    for (var i = 0; i < keys.length; i++) {
+      var lines = bomForKey(bom, keys[i]);
+      if (lines.length) return lines;
+    }
+    return [];
+  }
+
   /**
-   * FG requirement for one order.
-   * Returns [{materialCode, materialName, requiredQty, unit, productName, orderId}]
+   * FG requirement for one order line.
+   * Returns [{materialCode, materialName, perUnit, requiredQty, unit, productName, orderId}]
    */
   function orderRequirements(order, bom) {
-    var qty = n(order['Quantity']);
-    return bomForProduct(bom, order['Product Name']).map(function (b) {
+    var qty = orderQty(order);
+    return bomForOrder(bom, order).map(function (b) {
       return {
         orderId: order['Order ID'],
-        productName: order['Product Name'],
+        orderRow: order._row,
+        productName: orderLabel(order),
         materialCode: String(b['Raw Material Code'] || '').trim(),
         materialName: b['Raw Material Name'] || '',
         perUnit: n(b['Qty Per Unit']),
@@ -668,13 +703,8 @@ window.ENGINE = (function () {
   }
 
   /**
-   * Kitting evaluation of one order against live stock.
-   * Returns {
-   *   status: 'COMPLETE' | 'PENDING' | 'NO_BOM',
-   *   lines: [{...requirement, availableQty, shortageQty, ok}],
-   *   shortages: [...lines where shortage > 0],
-   *   coverage: 0..100  (percent of BOM lines fully available)
-   * }
+   * Kitting evaluation of one order line against live stock.
+   * Returns { status: 'COMPLETE'|'PENDING'|'NO_BOM', lines, shortages, coverage }
    */
   function evaluateOrder(order, bom, invMap) {
     var reqs = orderRequirements(order, bom);
@@ -688,7 +718,7 @@ window.ENGINE = (function () {
       var ok = shortage <= 0;
       if (ok) okCount++;
       return {
-        orderId: r.orderId, productName: r.productName,
+        orderId: r.orderId, orderRow: r.orderRow, productName: r.productName,
         materialCode: r.materialCode, materialName: r.materialName || (inv ? inv['Material Name'] : ''),
         perUnit: r.perUnit, requiredQty: r.requiredQty,
         availableQty: avail, shortageQty: shortage,
@@ -705,7 +735,7 @@ window.ENGINE = (function () {
     };
   }
 
-  /** Evaluate every active order. Returns [{order, result}] */
+  /** Evaluate every active order line. Returns [{order, result}] */
   function evaluateAll(orders, bom, inventory) {
     var invMap = inventoryMap(inventory);
     return activeOrders(orders).map(function (o) {
@@ -713,10 +743,7 @@ window.ENGINE = (function () {
     });
   }
 
-  /**
-   * Aggregate shortages across the given evaluations, merged by material code.
-   * Returns [{materialCode, materialName, unit, requiredQty, availableQty, shortageQty, orders:[...], products:[...]}]
-   */
+  /** Aggregate shortages across evaluations, merged by material code. */
   function aggregateShortages(evaluations) {
     var agg = {};
     evaluations.forEach(function (ev) {
@@ -739,10 +766,7 @@ window.ENGINE = (function () {
       .sort(function (a, b) { return b.shortageQty - a.shortageQty; });
   }
 
-  /**
-   * Total raw-material consumption implied by orders (for reports),
-   * merged by material, optionally filtered by a predicate on the order.
-   */
+  /** Total raw-material consumption implied by orders (for reports). */
   function consumption(orders, bom, filterFn) {
     var agg = {};
     (orders || []).forEach(function (o) {
@@ -757,12 +781,13 @@ window.ENGINE = (function () {
       .sort(function (a, b) { return b.qty - a.qty; });
   }
 
-  /** Distinct product list from BOM: [{category, product, lineCount}] */
+  /** Distinct product list from BOM: [{category, sub, product, lineCount}] */
   function bomProducts(bom) {
     var map = {};
     (bom || []).forEach(function (b) {
-      var key = String(b['Product Name'] || '').trim().toLowerCase();
-      if (!map[key]) map[key] = { category: b['Product Category'] || '', product: b['Product Name'] || '', lineCount: 0 };
+      var key = norm(b['Model No / SKU']);
+      if (!key) return;
+      if (!map[key]) map[key] = { category: b['Chair Category'] || '', sub: b['Sub Category'] || '', product: String(b['Model No / SKU']).trim(), lineCount: 0 };
       map[key].lineCount++;
     });
     return Object.keys(map).map(function (k) { return map[k]; })
@@ -771,7 +796,11 @@ window.ENGINE = (function () {
 
   return {
     inventoryMap: inventoryMap,
-    bomForProduct: bomForProduct,
+    bomForKey: bomForKey,
+    bomForOrder: bomForOrder,
+    orderKeys: orderKeys,
+    orderLabel: orderLabel,
+    orderQty: orderQty,
     orderRequirements: orderRequirements,
     activeOrders: activeOrders,
     evaluateOrder: evaluateOrder,
@@ -813,6 +842,17 @@ window.VIEWS = (function () {
       return '<option value="' + U.esc(v) + '"' + (v === selected ? ' selected' : '') + '>' + U.esc(v) + '</option>';
     }).join('');
   }
+
+  /** Dropdown list from the Masters sheet (live), with config fallback. */
+  function M(name, fallback) {
+    var m = (D().masters || {})[name];
+    return (m && m.length) ? m : (fallback || []);
+  }
+  function mCat() { return M('Chair Category', cfg.CHAIR_CATEGORIES); }
+  function mSub() { return M('Sub Category', cfg.SUB_CATEGORIES); }
+  function mType() { return M('Chair Type', cfg.CHAIR_TYPES); }
+  function mHandle() { return M('Handle Type', cfg.HANDLE_TYPES); }
+  function mFabric() { return M('Fabric File & Code', cfg.FABRICS); }
 
   /** Make a table sortable by clicking headers. */
   function makeSortable(table) {
@@ -869,20 +909,20 @@ window.VIEWS = (function () {
 
     root.appendChild(el(
       '<div class="card">' +
-      '<h2>➕ Create New Order <span class="sub">Order ID is auto-generated (leave blank) or type your own</span></h2>' +
+      '<h2>➕ Create New Order <span class="sub">Order ID blank = auto (ORD0552 style) · Specification ID blank = save date-time auto · same Order ID with multiple items allowed</span></h2>' +
       '<form class="frm" id="orderForm">' +
-      '  <div class="field"><label>Order ID (optional)</label><input name="Order ID" placeholder="auto e.g. ORD-2026-0001" /></div>' +
-      '  <div class="field"><label>Order Date *</label><input name="Order Date" type="date" required value="' + U.todayISO() + '" /></div>' +
-      '  <div class="field"><label>Customer Name *</label><input name="Customer Name" required placeholder="Customer / dealer name" /></div>' +
-      '  <div class="field"><label>Customer Contact</label><input name="Customer Contact" placeholder="Phone / email" /></div>' +
-      '  <div class="field"><label>Product Category *</label><select name="Product Category" required><option value="">— select —</option>' + options(cfg.CATEGORIES) + '</select></div>' +
-      '  <div class="field"><label>Product Name *</label><input name="Product Name" required list="productList" placeholder="Exactly as in Kitting Master" />' +
+      '  <div class="field"><label>ORDER ID (blank = auto)</label><input name="Order ID" placeholder="auto e.g. ORD0552" /></div>' +
+      '  <div class="field"><label>SPECIFICATION ID (blank = auto)</label><input name="Specification ID" placeholder="auto: save date-time" /></div>' +
+      '  <div class="field"><label>CHAIR TYPE *</label><select name="Chair Type" required><option value="">— select —</option>' + options(mType()) + '</select></div>' +
+      '  <div class="field"><label>CHAIR CATEGORY *</label><select name="Chair Category" required><option value="">— select —</option>' + options(mCat()) + '</select></div>' +
+      '  <div class="field"><label>ITEM PIC</label><input name="Item Pic" placeholder="SPECIFICATION_IMAGES\\474.ITEM PIC.JPG" /></div>' +
+      '  <div class="field"><label>SKU</label><input name="SKU" list="productList" placeholder="e.g. BOOMBLACK-1" />' +
       '    <datalist id="productList">' + products.map(function (p) { return '<option value="' + U.esc(p.product) + '">'; }).join('') + '</datalist></div>' +
-      '  <div class="field"><label>Quantity *</label><input name="Quantity" type="number" min="1" step="1" required placeholder="0" /></div>' +
-      '  <div class="field"><label>Required Delivery Date</label><input name="Required Delivery Date" type="date" /></div>' +
-      '  <div class="field"><label>Priority</label><select name="Priority">' + options(cfg.PRIORITIES, 'Normal') + '</select></div>' +
-      '  <div class="field"><label>Order Status</label><select name="Order Status">' + options(cfg.ORDER_STATUSES, 'Open') + '</select></div>' +
-      '  <div class="field span2"><label>Remarks</label><input name="Remarks" placeholder="Any additional order details" /></div>' +
+      '  <div class="field"><label>MODEL NO</label><input name="Model No" list="productList" placeholder="e.g. HIGH BACK CHAIR" /></div>' +
+      '  <div class="field"><label>FABRIC FILE &amp; CODE</label><input name="Fabric File & Code" list="fabricList" placeholder="e.g. LEATHER" />' +
+      '    <datalist id="fabricList">' + mFabric().map(function (f) { return '<option value="' + U.esc(f) + '">'; }).join('') + '</datalist></div>' +
+      '  <div class="field"><label>HANDLE TYPE</label><select name="Handle Type"><option value="">— select —</option>' + options(mHandle()) + '</select></div>' +
+      '  <div class="field"><label>ORDERED QTY *</label><input name="Ordered Qty" type="number" min="1" step="1" required placeholder="0" /></div>' +
       '  <div class="formactions">' +
       '    <button class="btn btn-primary" type="submit">Save Order</button>' +
       '    <button class="btn" type="reset">Clear</button>' +
@@ -894,8 +934,8 @@ window.VIEWS = (function () {
       e.preventDefault();
       var fd = new FormData(e.target), o = {};
       fd.forEach(function (v, k) { o[k] = v; });
-      var known = products.some(function (p) { return p.product.toLowerCase() === String(o['Product Name']).trim().toLowerCase(); });
-      if (!known && !confirm('"' + o['Product Name'] + '" has no BOM in the Kitting Master yet.\nKitting status will show "No BOM" until you add it.\n\nSave the order anyway?')) return;
+      var hasBom = ENGINE.bomForOrder(d.bom, o).length > 0;
+      if (!hasBom && !confirm('No BOM found in Kitting Master for this SKU / Model No / Chair Category.\nKitting status will show "No BOM" until you add it.\n\nSave the order anyway?')) return;
       try {
         APP.busy(true);
         var res = await API.createOrder(o);
@@ -907,12 +947,11 @@ window.VIEWS = (function () {
 
     // ---- filters + table ----
     var card = el(
-      '<div class="card"><h2>📋 Orders</h2>' +
+      '<div class="card"><h2>📋 Orders <span class="sub">live from the Orders tab of your Google Sheet — rows added directly in the sheet appear here automatically</span></h2>' +
       '<div class="filters">' +
       '  <div class="field"><label>Status</label><select id="fStatus"><option value="">All</option>' + options(cfg.ORDER_STATUSES) + '</select></div>' +
-      '  <div class="field"><label>Category</label><select id="fCat"><option value="">All</option>' + options(cfg.CATEGORIES) + '</select></div>' +
-      '  <div class="field"><label>From</label><input id="fFrom" type="date"/></div>' +
-      '  <div class="field"><label>To</label><input id="fTo" type="date"/></div>' +
+      '  <div class="field"><label>Chair Category</label><select id="fCat"><option value="">All</option>' + options(mCat()) + '</select></div>' +
+      '  <div class="field"><label>Chair Type</label><select id="fType"><option value="">All</option>' + options(mType()) + '</select></div>' +
       '  <button class="btn btn-sm" id="fClear">Clear filters</button>' +
       '  <span class="spacer"></span>' +
       '  <button class="btn btn-sm" id="expOrders">⬇ Excel</button>' +
@@ -921,94 +960,95 @@ window.VIEWS = (function () {
     );
     root.appendChild(card);
 
+    var ORDER_COLS = ['Order ID', 'Specification ID', 'Chair Type', 'Chair Category', 'Item Pic', 'SKU', 'Model No', 'Fabric File & Code', 'Handle Type', 'Ordered Qty', 'Order Status'];
+
     function draw() {
       var st = card.querySelector('#fStatus').value,
           cat = card.querySelector('#fCat').value,
-          from = card.querySelector('#fFrom').value,
-          to = card.querySelector('#fTo').value;
+          typ = card.querySelector('#fType').value;
       var rows = d.orders.filter(function (o) {
         if (st && o['Order Status'] !== st) return false;
-        if (cat && o['Product Category'] !== cat) return false;
-        if (from && String(o['Order Date']) < from) return false;
-        if (to && String(o['Order Date']) > to) return false;
-        return matchesSearch(o, ['Order ID', 'Customer Name', 'Product Name', 'Product Category', 'Order Status', 'Remarks']);
+        if (cat && o['Chair Category'] !== cat) return false;
+        if (typ && o['Chair Type'] !== typ) return false;
+        return matchesSearch(o, ['Order ID', 'Specification ID', 'Chair Type', 'Chair Category', 'Model No', 'SKU', 'Fabric File & Code', 'Handle Type', 'Order Status']);
       });
       var wrap = card.querySelector('#ordersTableWrap');
-      if (!rows.length) { wrap.innerHTML = '<div class="empty">No orders found. Create your first order above.</div>'; return; }
+      if (!rows.length) { wrap.innerHTML = '<div class="empty">No orders found. Create one above, or add rows directly in the Orders tab of your Google Sheet.</div>'; return; }
       wrap.innerHTML =
         '<table class="tbl"><thead><tr>' +
-        '<th data-sort>Order ID</th><th data-sort>Date</th><th data-sort>Customer</th><th data-sort>Category</th>' +
-        '<th data-sort>Product</th><th data-sort class="num">Qty</th><th data-sort>Delivery</th><th data-sort>Priority</th>' +
+        '<th data-sort>Order ID</th><th data-sort>Specification ID</th><th data-sort>Chair Type</th>' +
+        '<th data-sort>Chair Category</th><th data-sort>Item Pic</th><th data-sort>SKU</th><th data-sort>Model No</th>' +
+        '<th data-sort>Fabric File &amp; Code</th><th data-sort>Handle Type</th><th data-sort class="num">Ordered Qty</th>' +
         '<th data-sort>Status</th><th></th></tr></thead><tbody>' +
         rows.map(function (o) {
           return '<tr>' +
             '<td><b>' + U.esc(o['Order ID']) + '</b></td>' +
-            '<td>' + U.fmtDate(o['Order Date']) + '</td>' +
-            '<td>' + U.esc(o['Customer Name']) + '</td>' +
-            '<td>' + U.esc(o['Product Category']) + '</td>' +
-            '<td>' + U.esc(o['Product Name']) + '</td>' +
-            '<td class="num">' + U.fmtQty(o['Quantity']) + '</td>' +
-            '<td>' + U.fmtDate(o['Required Delivery Date']) + '</td>' +
-            '<td>' + U.esc(o['Priority'] || '') + '</td>' +
-            '<td>' + U.orderStatusPill(String(o['Order Status'])) + '</td>' +
+            '<td class="small">' + U.esc(o['Specification ID'] || '') + '</td>' +
+            '<td class="small">' + U.esc(o['Chair Type'] || '') + '</td>' +
+            '<td>' + U.esc(o['Chair Category'] || '') + '</td>' +
+            '<td class="small">' + U.esc(o['Item Pic'] || '') + '</td>' +
+            '<td>' + U.esc(o['SKU'] || '') + '</td>' +
+            '<td>' + U.esc(o['Model No'] || '') + '</td>' +
+            '<td class="small">' + U.esc(o['Fabric File & Code'] || '') + '</td>' +
+            '<td class="small">' + U.esc(o['Handle Type'] || '') + '</td>' +
+            '<td class="num">' + U.fmtQty(o['Ordered Qty']) + '</td>' +
+            '<td>' + U.orderStatusPill(String(o['Order Status'] || 'Open')) + '</td>' +
             '<td class="rowactions">' +
-            '  <button class="btn btn-sm" data-edit="' + U.esc(o['Order ID']) + '">✏️</button> ' +
-            '  <button class="btn btn-sm btn-danger" data-del="' + U.esc(o['Order ID']) + '">🗑</button>' +
+            '  <button class="btn btn-sm" data-edit="' + o._row + '">✏️</button> ' +
+            '  <button class="btn btn-sm btn-danger" data-del="' + o._row + '" data-oid="' + U.esc(o['Order ID']) + '">🗑</button>' +
             '</td></tr>';
         }).join('') + '</tbody></table>';
       makeSortable(wrap.querySelector('table'));
 
       wrap.querySelectorAll('[data-edit]').forEach(function (b) {
-        b.onclick = function () { editOrderModal(b.dataset.edit); };
+        b.onclick = function () { editOrderModal(Number(b.dataset.edit)); };
       });
       wrap.querySelectorAll('[data-del]').forEach(function (b) {
         b.onclick = async function () {
-          if (!confirm('Delete order ' + b.dataset.del + '? This cannot be undone.')) return;
-          try { APP.busy(true); await API.deleteOrder(b.dataset.del); U.toast('Order deleted', 'good'); await APP.reload(); }
+          if (!confirm('Delete this item line of order ' + b.dataset.oid + '? This cannot be undone.')) return;
+          try { APP.busy(true); await API.deleteOrderRow(Number(b.dataset.del)); U.toast('Order line deleted', 'good'); await APP.reload(); }
           catch (err) { U.toast(err.message, 'bad'); } finally { APP.busy(false); }
         };
       });
     }
-    ['fStatus', 'fCat', 'fFrom', 'fTo'].forEach(function (id) { card.querySelector('#' + id).addEventListener('change', draw); });
+    ['fStatus', 'fCat', 'fType'].forEach(function (id) { card.querySelector('#' + id).addEventListener('change', draw); });
     card.querySelector('#fClear').onclick = function () {
-      ['fStatus', 'fCat', 'fFrom', 'fTo'].forEach(function (id) { card.querySelector('#' + id).value = ''; });
+      ['fStatus', 'fCat', 'fType'].forEach(function (id) { card.querySelector('#' + id).value = ''; });
       draw();
     };
     card.querySelector('#expOrders').onclick = function () {
       U.exportExcel('Orders.xlsx', [{
         name: 'Orders',
-        headers: ['Order ID', 'Order Date', 'Customer Name', 'Customer Contact', 'Product Category', 'Product Name', 'Quantity', 'Required Delivery Date', 'Priority', 'Order Status', 'Remarks'],
-        rows: d.orders.map(function (o) {
-          return ['Order ID', 'Order Date', 'Customer Name', 'Customer Contact', 'Product Category', 'Product Name', 'Quantity', 'Required Delivery Date', 'Priority', 'Order Status', 'Remarks']
-            .map(function (h) { return o[h]; });
-        })
+        headers: ORDER_COLS,
+        rows: d.orders.map(function (o) { return ORDER_COLS.map(function (h) { return o[h]; }); })
       }]);
     };
     draw();
     APP.onSearch(draw);
   }
 
-  function editOrderModal(orderId) {
-    var o = D().orders.find(function (x) { return String(x['Order ID']) === String(orderId); });
+  function editOrderModal(rowNum) {
+    var o = D().orders.find(function (x) { return Number(x._row) === Number(rowNum); });
     if (!o) return;
-    openModal('Edit Order — ' + orderId,
+    openModal('Edit Order — ' + o['Order ID'] + ' (' + ENGINE.orderLabel(o) + ')',
       '<form class="frm" id="editOrderForm">' +
-      '  <div class="field"><label>Order Date</label><input name="Order Date" type="date" value="' + U.esc(o['Order Date']) + '"/></div>' +
-      '  <div class="field"><label>Customer Name</label><input name="Customer Name" value="' + U.esc(o['Customer Name']) + '"/></div>' +
-      '  <div class="field"><label>Customer Contact</label><input name="Customer Contact" value="' + U.esc(o['Customer Contact'] || '') + '"/></div>' +
-      '  <div class="field"><label>Product Category</label><select name="Product Category">' + options(cfg.CATEGORIES, o['Product Category']) + '</select></div>' +
-      '  <div class="field"><label>Product Name</label><input name="Product Name" value="' + U.esc(o['Product Name']) + '"/></div>' +
-      '  <div class="field"><label>Quantity</label><input name="Quantity" type="number" min="1" value="' + U.esc(o['Quantity']) + '"/></div>' +
-      '  <div class="field"><label>Required Delivery Date</label><input name="Required Delivery Date" type="date" value="' + U.esc(o['Required Delivery Date']) + '"/></div>' +
-      '  <div class="field"><label>Priority</label><select name="Priority">' + options(cfg.PRIORITIES, o['Priority']) + '</select></div>' +
-      '  <div class="field"><label>Order Status</label><select name="Order Status">' + options(cfg.ORDER_STATUSES, o['Order Status']) + '</select></div>' +
-      '  <div class="field span3"><label>Remarks</label><input name="Remarks" value="' + U.esc(o['Remarks'] || '') + '"/></div>' +
+      '  <div class="field"><label>SPECIFICATION ID</label><input name="Specification ID" value="' + U.esc(o['Specification ID'] || '') + '"/></div>' +
+      '  <div class="field"><label>CHAIR TYPE</label><select name="Chair Type"><option value="">—</option>' + options(mType(), o['Chair Type']) + '</select></div>' +
+      '  <div class="field"><label>CHAIR CATEGORY</label><select name="Chair Category"><option value="">—</option>' + options(mCat(), o['Chair Category']) + '</select></div>' +
+      '  <div class="field"><label>ITEM PIC</label><input name="Item Pic" value="' + U.esc(o['Item Pic'] || '') + '"/></div>' +
+      '  <div class="field"><label>SKU</label><input name="SKU" value="' + U.esc(o['SKU'] || '') + '"/></div>' +
+      '  <div class="field"><label>MODEL NO</label><input name="Model No" value="' + U.esc(o['Model No'] || '') + '"/></div>' +
+      '  <div class="field"><label>FABRIC FILE &amp; CODE</label><input name="Fabric File & Code" value="' + U.esc(o['Fabric File & Code'] || '') + '"/></div>' +
+      '  <div class="field"><label>HANDLE TYPE</label><select name="Handle Type"><option value="">—</option>' + options(mHandle(), o['Handle Type']) + '</select></div>' +
+      '  <div class="field"><label>ORDERED QTY</label><input name="Ordered Qty" type="number" min="1" value="' + U.esc(o['Ordered Qty']) + '"/></div>' +
+      '  <div class="field"><label>Order Status</label><select name="Order Status">' + options(cfg.ORDER_STATUSES, o['Order Status'] || 'Open') + '</select></div>' +
       '</form>',
       '<button class="btn" id="mCancel">Cancel</button><button class="btn btn-primary" id="mSave">Save Changes</button>'
     );
     document.getElementById('mCancel').onclick = closeModal;
     document.getElementById('mSave').onclick = async function () {
-      var fd = new FormData(document.getElementById('editOrderForm')), p = { 'Order ID': orderId };
+      var fd = new FormData(document.getElementById('editOrderForm'));
+      var p = { 'Order ID': o['Order ID'], _row: o._row };
       fd.forEach(function (v, k) { p[k] = v; });
       try { APP.busy(true); await API.updateOrder(p); U.toast('Order updated', 'good'); closeModal(); await APP.reload(); }
       catch (err) { U.toast(err.message, 'bad'); } finally { APP.busy(false); }
@@ -1024,10 +1064,11 @@ window.VIEWS = (function () {
     // --- entry form: product header + dynamic material lines ---
     var formCard = el(
       '<div class="card">' +
-      '<h2>🧩 Define Product Kitting (BOM) <span class="sub">Add all raw materials required to build one unit of a product</span></h2>' +
+      '<h2>🧩 Define Product Kitting (BOM) <span class="sub">Add all raw materials required to build one unit of a product. Category lists come live from the Masters tab of your Google Sheet.</span></h2>' +
       '<div class="frm" style="margin-bottom:10px">' +
-      '  <div class="field"><label>Product Category *</label><select id="bomCat"><option value="">— select —</option>' + options(cfg.CATEGORIES) + '</select></div>' +
-      '  <div class="field span2"><label>Product Name *</label><input id="bomProduct" placeholder="e.g. Royal Oak Recliner Sofa 3-Seater" /></div>' +
+      '  <div class="field"><label>Chair Category *</label><select id="bomCat"><option value="">— select —</option>' + options(mCat()) + '</select></div>' +
+      '  <div class="field"><label>Sub Category</label><select id="bomSub"><option value="">— select —</option>' + options(mSub()) + '</select></div>' +
+      '  <div class="field"><label>Model No / SKU *</label><input id="bomProduct" placeholder="e.g. HIGH BACK CHAIR ya BOOMBLACK-1" /></div>' +
       '</div>' +
       '<div class="tablewrap"><table class="tbl" id="bomLines"><thead><tr>' +
       '<th>Raw Material Code *</th><th>Raw Material Name *</th><th class="num">Qty / Unit *</th><th>Unit</th><th></th>' +
@@ -1068,8 +1109,9 @@ window.VIEWS = (function () {
 
     formCard.querySelector('#saveBom').onclick = async function () {
       var cat = formCard.querySelector('#bomCat').value,
+          sub = formCard.querySelector('#bomSub').value,
           prod = formCard.querySelector('#bomProduct').value.trim();
-      if (!cat || !prod) return U.toast('Select a category and enter the product name', 'bad');
+      if (!cat || !prod) return U.toast('Select a Chair Category and enter the Model No / SKU', 'bad');
       var items = [];
       formCard.querySelectorAll('#bomLines tbody tr').forEach(function (tr) {
         var code = tr.querySelector('.lc').value.trim(),
@@ -1077,7 +1119,7 @@ window.VIEWS = (function () {
             qty = Number(tr.querySelector('.lq').value),
             unit = tr.querySelector('.lu').value;
         if (code && name && qty > 0) {
-          items.push({ 'Product Category': cat, 'Product Name': prod, 'Raw Material Code': code, 'Raw Material Name': name, 'Qty Per Unit': qty, 'Unit': unit });
+          items.push({ 'Chair Category': cat, 'Sub Category': sub, 'Model No / SKU': prod, 'Raw Material Code': code, 'Raw Material Name': name, 'Qty Per Unit': qty, 'Unit': unit });
         }
       });
       if (!items.length) return U.toast('Add at least one complete material line (code, name, qty)', 'bad');
@@ -1097,8 +1139,9 @@ window.VIEWS = (function () {
     var listCard = el(
       '<div class="card"><h2>📚 Kitting Master Database <span class="sub">' + products.length + ' products · ' + d.bom.length + ' material lines</span></h2>' +
       '<div class="filters">' +
-      '  <div class="field"><label>Category</label><select id="bfCat"><option value="">All</option>' + options(cfg.CATEGORIES) + '</select></div>' +
-      '  <div class="field"><label>Product</label><select id="bfProd"><option value="">All</option>' + products.map(function (p) { return '<option>' + U.esc(p.product) + '</option>'; }).join('') + '</select></div>' +
+      '  <div class="field"><label>Chair Category</label><select id="bfCat"><option value="">All</option>' + options(mCat()) + '</select></div>' +
+      '  <div class="field"><label>Sub Category</label><select id="bfSub"><option value="">All</option>' + options(mSub()) + '</select></div>' +
+      '  <div class="field"><label>Model / SKU</label><select id="bfProd"><option value="">All</option>' + products.map(function (p) { return '<option>' + U.esc(p.product) + '</option>'; }).join('') + '</select></div>' +
       '  <span class="spacer"></span>' +
       '  <button class="btn btn-sm" id="expBom">⬇ Excel</button>' +
       '</div>' +
@@ -1107,22 +1150,25 @@ window.VIEWS = (function () {
     root.appendChild(listCard);
 
     function drawBom() {
-      var cat = listCard.querySelector('#bfCat').value, prod = listCard.querySelector('#bfProd').value;
+      var cat = listCard.querySelector('#bfCat').value,
+          sub = listCard.querySelector('#bfSub').value,
+          prod = listCard.querySelector('#bfProd').value;
       var rows = d.bom.filter(function (b) {
-        if (cat && b['Product Category'] !== cat) return false;
-        if (prod && b['Product Name'] !== prod) return false;
-        return matchesSearch(b, ['Product Name', 'Product Category', 'Raw Material Code', 'Raw Material Name']);
+        if (cat && b['Chair Category'] !== cat) return false;
+        if (sub && b['Sub Category'] !== sub) return false;
+        if (prod && b['Model No / SKU'] !== prod) return false;
+        return matchesSearch(b, ['Model No / SKU', 'Chair Category', 'Sub Category', 'Raw Material Code', 'Raw Material Name']);
       });
       var wrap = listCard.querySelector('#bomTableWrap');
       if (!rows.length) { wrap.innerHTML = '<div class="empty">No BOM lines yet. Define your first product above.</div>'; return; }
       wrap.innerHTML =
         '<table class="tbl"><thead><tr>' +
-        '<th data-sort>BOM ID</th><th data-sort>Category</th><th data-sort>Product</th><th data-sort>Material Code</th>' +
+        '<th data-sort>BOM ID</th><th data-sort>Chair Category</th><th data-sort>Sub Category</th><th data-sort>Model / SKU</th><th data-sort>Material Code</th>' +
         '<th data-sort>Material Name</th><th data-sort class="num">Qty / Unit</th><th data-sort>Unit</th><th></th>' +
         '</tr></thead><tbody>' +
         rows.map(function (b) {
           return '<tr><td class="muted small">' + U.esc(b['BOM ID']) + '</td>' +
-            '<td>' + U.esc(b['Product Category']) + '</td><td><b>' + U.esc(b['Product Name']) + '</b></td>' +
+            '<td>' + U.esc(b['Chair Category']) + '</td><td class="small">' + U.esc(b['Sub Category'] || '') + '</td><td><b>' + U.esc(b['Model No / SKU']) + '</b></td>' +
             '<td>' + U.esc(b['Raw Material Code']) + '</td><td>' + U.esc(b['Raw Material Name']) + '</td>' +
             '<td class="num">' + U.fmtQty(b['Qty Per Unit']) + '</td><td>' + U.esc(b['Unit']) + '</td>' +
             '<td class="rowactions">' +
@@ -1139,13 +1185,13 @@ window.VIEWS = (function () {
         };
       });
     }
-    ['bfCat', 'bfProd'].forEach(function (id) { listCard.querySelector('#' + id).addEventListener('change', drawBom); });
+    ['bfCat', 'bfSub', 'bfProd'].forEach(function (id) { listCard.querySelector('#' + id).addEventListener('change', drawBom); });
     listCard.querySelector('#expBom').onclick = function () {
       U.exportExcel('KittingMaster.xlsx', [{
         name: 'Kitting Master',
-        headers: ['BOM ID', 'Product Category', 'Product Name', 'Raw Material Code', 'Raw Material Name', 'Qty Per Unit', 'Unit'],
+        headers: ['BOM ID', 'Chair Category', 'Sub Category', 'Model No / SKU', 'Raw Material Code', 'Raw Material Name', 'Qty Per Unit', 'Unit'],
         rows: d.bom.map(function (b) {
-          return ['BOM ID', 'Product Category', 'Product Name', 'Raw Material Code', 'Raw Material Name', 'Qty Per Unit', 'Unit'].map(function (h) { return b[h]; });
+          return ['BOM ID', 'Chair Category', 'Sub Category', 'Model No / SKU', 'Raw Material Code', 'Raw Material Name', 'Qty Per Unit', 'Unit'].map(function (h) { return b[h]; });
         })
       }]);
     };
@@ -1158,8 +1204,9 @@ window.VIEWS = (function () {
     if (!b) return;
     openModal('Edit BOM Line — ' + bomId,
       '<form class="frm" id="editBomForm">' +
-      '  <div class="field"><label>Product Category</label><select name="Product Category">' + options(cfg.CATEGORIES, b['Product Category']) + '</select></div>' +
-      '  <div class="field span2"><label>Product Name</label><input name="Product Name" value="' + U.esc(b['Product Name']) + '"/></div>' +
+      '  <div class="field"><label>Chair Category</label><select name="Chair Category">' + options(mCat(), b['Chair Category']) + '</select></div>' +
+      '  <div class="field"><label>Sub Category</label><select name="Sub Category"><option value="">—</option>' + options(mSub(), b['Sub Category']) + '</select></div>' +
+      '  <div class="field"><label>Model No / SKU</label><input name="Model No / SKU" value="' + U.esc(b['Model No / SKU']) + '"/></div>' +
       '  <div class="field"><label>Raw Material Code</label><input name="Raw Material Code" value="' + U.esc(b['Raw Material Code']) + '"/></div>' +
       '  <div class="field"><label>Raw Material Name</label><input name="Raw Material Name" value="' + U.esc(b['Raw Material Name']) + '"/></div>' +
       '  <div class="field"><label>Qty Per Unit</label><input name="Qty Per Unit" type="number" min="0" step="any" value="' + U.esc(b['Qty Per Unit']) + '"/></div>' +
@@ -1187,7 +1234,7 @@ window.VIEWS = (function () {
       '<div class="card"><h2>🏭 Finished Goods — Raw Material Requirement <span class="sub">Auto-calculated: Order × Kitting Master</span></h2>' +
       '<div class="filters">' +
       '  <div class="field"><label>Order</label><select id="fgOrder"><option value="">All active orders</option>' +
-      active.map(function (o) { return '<option value="' + U.esc(o['Order ID']) + '">' + U.esc(o['Order ID'] + ' — ' + o['Product Name']) + '</option>'; }).join('') +
+      active.map(function (o) { return '<option value="' + o._row + '">' + U.esc(o['Order ID'] + ' — ' + ENGINE.orderLabel(o)) + '</option>'; }).join('') +
       '  </select></div>' +
       '  <span class="spacer"></span>' +
       '  <button class="btn btn-sm" id="fgExcel">⬇ Excel</button>' +
@@ -1200,7 +1247,7 @@ window.VIEWS = (function () {
 
     function currentData() {
       var sel = card.querySelector('#fgOrder').value;
-      var orders = sel ? active.filter(function (o) { return o['Order ID'] === sel; }) : active;
+      var orders = sel ? active.filter(function (o) { return String(o._row) === sel; }) : active;
       return orders.map(function (o) { return { order: o, reqs: ENGINE.orderRequirements(o, d.bom) }; });
     }
 
@@ -1210,10 +1257,10 @@ window.VIEWS = (function () {
       if (!data.length) { body.innerHTML = '<div class="empty">No active orders. Create an order in the Order Form tab.</div>'; return; }
       body.innerHTML = data.map(function (blk) {
         var o = blk.order;
-        var head = '<div class="mt"><b>' + U.esc(o['Order ID']) + '</b> · ' + U.esc(o['Product Name']) +
-          ' · Qty <b>' + U.fmtQty(o['Quantity']) + '</b> · ' + U.esc(o['Customer Name']) +
-          ' · Delivery ' + (U.fmtDate(o['Required Delivery Date']) || '—') + '</div>';
-        if (!blk.reqs.length) return head + '<div class="notice">No BOM defined for "' + U.esc(o['Product Name']) + '" — add it in the Kitting Master tab.</div>';
+        var head = '<div class="mt"><b>' + U.esc(o['Order ID']) + '</b> · ' + U.esc(ENGINE.orderLabel(o)) +
+          ' · ' + U.esc(o['Chair Category'] || '') +
+          ' · Qty <b>' + U.fmtQty(o['Ordered Qty']) + '</b></div>';
+        if (!blk.reqs.length) return head + '<div class="notice">No BOM defined for "' + U.esc(ENGINE.orderLabel(o)) + '" (SKU/Model/Category se koi match nahi mila) — add it in the Kitting Master tab.</div>';
         var searchRows = blk.reqs.filter(function (r) {
           return matchesSearch({ a: r.materialCode, b: r.materialName, c: r.orderId, d: r.productName }, ['a', 'b', 'c', 'd']);
         });
@@ -1369,13 +1416,13 @@ window.VIEWS = (function () {
       var f = card.querySelector('#kFilter').value;
       var rows = evals.filter(function (ev) {
         if (f && ev.result.status !== f) return false;
-        return matchesSearch(ev.order, ['Order ID', 'Customer Name', 'Product Name', 'Product Category']);
+        return matchesSearch(ev.order, ['Order ID', 'Specification ID', 'Model No', 'SKU', 'Chair Category']);
       });
       var wrap = card.querySelector('#kWrap');
       if (!rows.length) { wrap.innerHTML = '<div class="empty">Nothing to show.</div>'; return; }
       wrap.innerHTML =
         '<table class="tbl"><thead><tr>' +
-        '<th>Order ID</th><th>Customer</th><th>Product</th><th class="num">Qty</th><th>Delivery</th>' +
+        '<th>Order ID</th><th>Specification ID</th><th>Chair Category</th><th>Model / SKU</th><th class="num">Qty</th>' +
         '<th>Material Coverage</th><th>Kitting Status</th><th></th></tr></thead><tbody>' +
         rows.map(function (ev) {
           var o = ev.order, r = ev.result;
@@ -1385,28 +1432,28 @@ window.VIEWS = (function () {
             '<span class="muted">— No BOM defined</span>';
           var meter = r.status === 'NO_BOM' ? '—' :
             '<span class="meter' + (r.coverage === 100 ? ' full' : '') + '"><span style="width:' + r.coverage + '%"></span></span> <span class="small muted">' + r.coverage + '%</span>';
-          var actions = '<button class="btn btn-sm" data-detail="' + U.esc(o['Order ID']) + '">Details</button>';
+          var actions = '<button class="btn btn-sm" data-detail="' + o._row + '">Details</button>';
           if (r.status === 'PENDING') {
             actions += ' <button class="btn btn-sm btn-order" data-shortage="' + U.esc(o['Order ID']) + '">🛒 Order Raw Material</button>';
           }
-          return '<tr><td><b>' + U.esc(o['Order ID']) + '</b></td><td>' + U.esc(o['Customer Name']) + '</td>' +
-            '<td>' + U.esc(o['Product Name']) + '</td><td class="num">' + U.fmtQty(o['Quantity']) + '</td>' +
-            '<td>' + U.fmtDate(o['Required Delivery Date']) + '</td>' +
+          return '<tr><td><b>' + U.esc(o['Order ID']) + '</b></td><td class="small">' + U.esc(o['Specification ID'] || '') + '</td>' +
+            '<td>' + U.esc(o['Chair Category'] || '') + '</td>' +
+            '<td>' + U.esc(ENGINE.orderLabel(o)) + '</td><td class="num">' + U.fmtQty(o['Ordered Qty']) + '</td>' +
             '<td>' + meter + '</td><td>' + statusHTML + '</td>' +
             '<td class="rowactions">' + actions + '</td></tr>';
         }).join('') + '</tbody></table>';
 
-      wrap.querySelectorAll('[data-detail]').forEach(function (b) { b.onclick = function () { kittingDetailModal(b.dataset.detail); }; });
+      wrap.querySelectorAll('[data-detail]').forEach(function (b) { b.onclick = function () { kittingDetailModal(Number(b.dataset.detail)); }; });
       wrap.querySelectorAll('[data-shortage]').forEach(function (b) { b.onclick = function () { shortageModal([b.dataset.shortage]); }; });
     }
     card.querySelector('#kFilter').addEventListener('change', draw);
     card.querySelector('#kExcel').onclick = function () {
       U.exportExcel('Kitting_Status.xlsx', [{
         name: 'Kitting Status',
-        headers: ['Order ID', 'Customer', 'Product', 'Qty', 'Delivery Date', 'Coverage %', 'Kitting Status'],
+        headers: ['Order ID', 'Specification ID', 'Chair Category', 'Model / SKU', 'Qty', 'Coverage %', 'Kitting Status'],
         rows: evals.map(function (ev) {
-          return [ev.order['Order ID'], ev.order['Customer Name'], ev.order['Product Name'], ev.order['Quantity'],
-            ev.order['Required Delivery Date'], ev.result.coverage,
+          return [ev.order['Order ID'], ev.order['Specification ID'], ev.order['Chair Category'], ENGINE.orderLabel(ev.order), ev.order['Ordered Qty'],
+            ev.result.coverage,
             ev.result.status === 'COMPLETE' ? 'Full Kitting Completed' : ev.result.status === 'PENDING' ? 'Full Kitting Pending' : 'No BOM'];
         })
       }]);
@@ -1430,12 +1477,12 @@ window.VIEWS = (function () {
     }
   }
 
-  function kittingDetailModal(orderId) {
+  function kittingDetailModal(rowNum) {
     var d = D();
-    var o = d.orders.find(function (x) { return String(x['Order ID']) === String(orderId); });
+    var o = d.orders.find(function (x) { return Number(x._row) === Number(rowNum); });
     if (!o) return;
     var r = ENGINE.evaluateOrder(o, d.bom, ENGINE.inventoryMap(d.inventory));
-    openModal('Kitting Detail — ' + orderId + ' (' + o['Product Name'] + ' × ' + o['Quantity'] + ')',
+    openModal('Kitting Detail — ' + o['Order ID'] + ' (' + ENGINE.orderLabel(o) + ' × ' + U.fmtQty(o['Ordered Qty']) + ')',
       (r.status === 'NO_BOM' ? '<div class="notice">No BOM defined for this product.</div>' :
         '<div class="tablewrap"><table class="tbl"><thead><tr>' +
         '<th>Code</th><th>Material</th><th class="num">Required</th><th class="num">Available</th><th class="num">Shortage</th><th>Unit</th><th>Status</th>' +
@@ -1914,13 +1961,17 @@ window.APP = (function () {
         scales: { x: { beginAtZero: true, grid: { color: t.grid } }, y: { grid: { display: false } } } }
     });
 
-    // Monthly trend — line
+    // Monthly trend — line (month parsed from Specification ID: dd/MM/yyyy HH:mm:ss)
+    function orderMonthKey(o) {
+      var m = /(\d{2})\/(\d{2})\/(\d{4})/.exec(String(o['Specification ID'] || ''));
+      return m ? (m[3] + '-' + m[2]) : '';
+    }
     var months = [], counts = [];
     for (var i = 5; i >= 0; i--) {
       var dt = new Date(); dt.setDate(1); dt.setMonth(dt.getMonth() - i);
       var key = dt.getFullYear() + '-' + ('0' + (dt.getMonth() + 1)).slice(-2);
       months.push(dt.toLocaleDateString('en-IN', { month: 'short', year: '2-digit' }));
-      counts.push(d.orders.filter(function (o) { return String(o['Order Date']).indexOf(key) === 0; }).length);
+      counts.push(d.orders.filter(function (o) { return orderMonthKey(o) === key; }).length);
     }
     chart(root.querySelector('#chTrend'), {
       type: 'line',
@@ -1930,25 +1981,21 @@ window.APP = (function () {
         scales: { y: { beginAtZero: true, ticks: { precision: 0 }, grid: { color: t.grid } }, x: { grid: { display: false } } } }
     });
 
-    // Upcoming deliveries
-    var upcoming = active.slice().filter(function (o) { return o['Required Delivery Date']; })
-      .sort(function (a, b) { return String(a['Required Delivery Date']).localeCompare(String(b['Required Delivery Date'])); })
-      .slice(0, 8);
+    // Recent order lines
+    var recent = active.slice().sort(function (a, b) { return Number(b._row) - Number(a._row); }).slice(0, 8);
     var evMap = {};
-    evals.forEach(function (e) { evMap[e.order['Order ID']] = e.result; });
+    evals.forEach(function (e) { evMap[e.order._row] = e.result; });
     root.insertAdjacentHTML('beforeend',
-      '<div class="card"><h2>⏰ Upcoming Deliveries</h2><div class="tablewrap">' +
-      (!upcoming.length ? '<div class="empty">No upcoming deliveries.</div>' :
-        '<table class="tbl"><thead><tr><th>Order</th><th>Customer</th><th>Product</th><th class="num">Qty</th><th>Delivery Date</th><th>Days Left</th><th>Kitting</th></tr></thead><tbody>' +
-        upcoming.map(function (o) {
-          var days = Math.ceil((new Date(o['Required Delivery Date']) - new Date()) / 86400000);
-          var r = evMap[o['Order ID']] || { status: 'NO_BOM' };
+      '<div class="card"><h2>🕘 Recent Orders</h2><div class="tablewrap">' +
+      (!recent.length ? '<div class="empty">No active orders.</div>' :
+        '<table class="tbl"><thead><tr><th>Order</th><th>Specification ID</th><th>Chair Category</th><th>Model / SKU</th><th class="num">Qty</th><th>Kitting</th></tr></thead><tbody>' +
+        recent.map(function (o) {
+          var r = evMap[o._row] || { status: 'NO_BOM' };
           var kit = r.status === 'COMPLETE' ? '<span class="kit-complete">✔ Completed</span>'
             : r.status === 'PENDING' ? '<span class="kit-pending">✖ Pending</span>' : '<span class="muted">No BOM</span>';
-          return '<tr><td><b>' + U.esc(o['Order ID']) + '</b></td><td>' + U.esc(o['Customer Name']) + '</td>' +
-            '<td>' + U.esc(o['Product Name']) + '</td><td class="num">' + U.fmtQty(o['Quantity']) + '</td>' +
-            '<td>' + U.fmtDate(o['Required Delivery Date']) + '</td>' +
-            '<td>' + (days < 0 ? '<b style="color:var(--critical)">Overdue ' + (-days) + 'd</b>' : days + ' days') + '</td>' +
+          return '<tr><td><b>' + U.esc(o['Order ID']) + '</b></td><td class="small">' + U.esc(o['Specification ID'] || '') + '</td>' +
+            '<td>' + U.esc(o['Chair Category'] || '') + '</td>' +
+            '<td>' + U.esc(ENGINE.orderLabel(o)) + '</td><td class="num">' + U.fmtQty(o['Ordered Qty']) + '</td>' +
             '<td>' + kit + '</td></tr>';
         }).join('') + '</tbody></table>') +
       '</div></div>');
@@ -1965,11 +2012,11 @@ window.APP = (function () {
     /* ---- Product-wise analysis ---- */
     var prodAgg = {};
     d.orders.forEach(function (o) {
-      var k = String(o['Product Name'] || '').trim();
-      if (!k) return;
-      if (!prodAgg[k]) prodAgg[k] = { product: k, category: o['Product Category'], orders: 0, qty: 0 };
+      var k = ENGINE.orderLabel(o);
+      if (!k || k === '—') return;
+      if (!prodAgg[k]) prodAgg[k] = { product: k, category: o['Chair Category'] || '', orders: 0, qty: 0 };
       prodAgg[k].orders++;
-      prodAgg[k].qty += U.num(o['Quantity']);
+      prodAgg[k].qty += U.num(o['Ordered Qty']);
     });
     var prodRows = Object.keys(prodAgg).map(function (k) { return prodAgg[k]; })
       .sort(function (a, b) { return b.qty - a.qty; });
