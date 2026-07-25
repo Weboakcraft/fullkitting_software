@@ -373,6 +373,8 @@ window.KMS_CONFIG = {
   // add a value in any Masters column and it appears in the app automatically.
   CHAIR_CATEGORIES: ['KBC', 'HIGH BACK CHAIR', 'MEDIUM BACK CHAIR', 'MESH CHAIR W', 'MESH CHAIR G', 'BOOM BLACK', 'ROBO WHITE', 'POLO WHITE', '898 CHAIR', '805 CHAIR', '802 CHAIR', 'NAG NAGIN', 'MATRIX HIGH BACK BLACK', '15 NO CHAIR', 'SPINAL HB1', 'SPINAL HB2', 'SPINAL HB3', 'KBC CHAIR'],
   SUB_CATEGORIES: ['Chair', 'Sofa', 'Wardrobe (Almirah)', 'Recliner Chair', 'Recliner Sofa', 'Bed', 'Table', 'Other'],
+  // Standard raw-material lines auto-loaded when Chair Category = Chair
+  CHAIR_PRESET_MATERIALS: ['Handle', 'Plate', 'Foam', 'Fabric', 'Base', 'Wheels', 'Hydraulic', 'Back Patta', 'Frame'],
   CHAIR_TYPES: ['CUSTOMIZED PRODUCT', 'EXISTING PRODUCT'],
   HANDLE_TYPES: ['FIXED HANDLE', 'U TYPE HANDLE', 'OLA HANDLE', 'BAR STOOL', 'WORKSTATION', '0'],
   FABRICS: ['LEATHER', 'LEATHER BLACK', 'MESH', 'BLACK MESH', 'BROWN', 'BLACK'],
@@ -1071,7 +1073,7 @@ window.VIEWS = (function () {
       '  <div class="field"><label>Model No / SKU *</label><input id="bomProduct" placeholder="e.g. HIGH BACK CHAIR ya BOOMBLACK-1" /></div>' +
       '</div>' +
       '<div class="tablewrap"><table class="tbl" id="bomLines"><thead><tr>' +
-      '<th>Raw Material Code *</th><th>Raw Material Name *</th><th class="num">Qty / Unit *</th><th>Unit</th><th></th>' +
+      '<th>Raw Material Code *</th><th>Raw Material Name *</th><th>Type</th><th class="num">Qty / Unit *</th><th>Unit</th><th></th>' +
       '</tr></thead><tbody></tbody></table></div>' +
       '<div class="toolrow mt">' +
       '  <button class="btn btn-sm" id="addLine">＋ Add Material Line</button>' +
@@ -1112,15 +1114,17 @@ window.VIEWS = (function () {
       do { code = 'RM-' + String(n).padStart(4, '0'); n++; } while (used[code]);
       return code;
     }
-    function addLine() {
+    function addLine(presetName) {
       var tr = el('<tr>' +
         '<td><input class="lc" list="matCodes" placeholder="RM-0001" style="width:100%;padding:6px 8px;border:1px solid var(--baseline);border-radius:7px;background:var(--surface);color:var(--ink)"/></td>' +
         '<td><input class="ln" placeholder="Material name" style="width:100%;padding:6px 8px;border:1px solid var(--baseline);border-radius:7px;background:var(--surface);color:var(--ink)"/></td>' +
+        '<td><input class="lt" placeholder="Type" style="width:100%;padding:6px 8px;border:1px solid var(--baseline);border-radius:7px;background:var(--surface);color:var(--ink)"/></td>' +
         '<td><input class="lq num" type="number" min="0" step="any" placeholder="0" style="width:90px;padding:6px 8px;border:1px solid var(--baseline);border-radius:7px;background:var(--surface);color:var(--ink);text-align:right"/></td>' +
         '<td><select class="lu" style="padding:6px 8px;border:1px solid var(--baseline);border-radius:7px;background:var(--surface);color:var(--ink)">' + options(cfg.UNITS, 'PCS') + '</select></td>' +
         '<td class="rowactions"><button class="btn btn-sm btn-danger rm">✕</button></td></tr>');
       tr.querySelector('.rm').onclick = function () { tr.remove(); };
       tr.querySelector('.lc').value = nextRmCode();
+      if (presetName) tr.querySelector('.ln').value = presetName;
       // auto-fill name/unit from inventory when a known code is chosen
       tr.querySelector('.lc').addEventListener('change', function () {
         var code = this.value.trim().toUpperCase();
@@ -1132,8 +1136,22 @@ window.VIEWS = (function () {
       });
       formCard.querySelector('#bomLines tbody').appendChild(tr);
     }
-    formCard.querySelector('#addLine').onclick = addLine;
-    addLine(); addLine(); addLine();
+    formCard.querySelector('#addLine').onclick = function () { addLine(); };
+
+    /* Rebuild the material rows: Chair Category = Chair loads the standard
+       chair components automatically, anything else starts with 3 blank rows. */
+    function resetLines() {
+      formCard.querySelector('#bomLines tbody').innerHTML = '';
+      var cat = String(formCard.querySelector('#bomCat').value || '').trim().toLowerCase();
+      var preset = cfg.CHAIR_PRESET_MATERIALS || [];
+      if (cat === 'chair' && preset.length) {
+        preset.forEach(function (nm) { addLine(nm); });
+      } else {
+        addLine(); addLine(); addLine();
+      }
+    }
+    formCard.querySelector('#bomCat').addEventListener('change', resetLines);
+    resetLines();
 
     formCard.querySelector('#saveBom').onclick = async function () {
       var cat = formCard.querySelector('#bomCat').value,
@@ -1144,10 +1162,11 @@ window.VIEWS = (function () {
       formCard.querySelectorAll('#bomLines tbody tr').forEach(function (tr) {
         var code = tr.querySelector('.lc').value.trim(),
             name = tr.querySelector('.ln').value.trim(),
+            type = tr.querySelector('.lt').value.trim(),
             qty = Number(tr.querySelector('.lq').value),
             unit = tr.querySelector('.lu').value;
         if (code && name && qty > 0) {
-          items.push({ 'Chair Category': cat, 'Sub Category': sub, 'Model No / SKU': prod, 'Raw Material Code': code, 'Raw Material Name': name, 'Qty Per Unit': qty, 'Unit': unit });
+          items.push({ 'Chair Category': cat, 'Sub Category': sub, 'Model No / SKU': prod, 'Raw Material Code': code, 'Raw Material Name': name, 'Type': type, 'Qty Per Unit': qty, 'Unit': unit });
         }
       });
       if (!items.length) return U.toast('Add at least one complete material line (code, name, qty)', 'bad');
@@ -1157,7 +1176,7 @@ window.VIEWS = (function () {
         U.toast(items.length + ' BOM lines saved for ' + prod, 'good');
         formCard.querySelector('#bomProduct').value = '';
         formCard.querySelectorAll('#bomLines tbody tr').forEach(function (tr) { tr.remove(); });
-        addLine(); addLine(); addLine();
+        resetLines();
         await APP.reload();
       } catch (err) { U.toast(err.message, 'bad'); } finally { APP.busy(false); }
     };
@@ -1185,19 +1204,20 @@ window.VIEWS = (function () {
         if (cat && b['Chair Category'] !== cat) return false;
         if (sub && b['Sub Category'] !== sub) return false;
         if (prod && b['Model No / SKU'] !== prod) return false;
-        return matchesSearch(b, ['Model No / SKU', 'Chair Category', 'Sub Category', 'Raw Material Code', 'Raw Material Name']);
+        return matchesSearch(b, ['Model No / SKU', 'Chair Category', 'Sub Category', 'Raw Material Code', 'Raw Material Name', 'Type']);
       });
       var wrap = listCard.querySelector('#bomTableWrap');
       if (!rows.length) { wrap.innerHTML = '<div class="empty">No BOM lines yet. Define your first product above.</div>'; return; }
       wrap.innerHTML =
         '<table class="tbl"><thead><tr>' +
         '<th data-sort>BOM ID</th><th data-sort>Chair Category</th><th data-sort>Sub Category</th><th data-sort>Model / SKU</th><th data-sort>Material Code</th>' +
-        '<th data-sort>Material Name</th><th data-sort class="num">Qty / Unit</th><th data-sort>Unit</th><th></th>' +
+        '<th data-sort>Material Name</th><th data-sort>Type</th><th data-sort class="num">Qty / Unit</th><th data-sort>Unit</th><th></th>' +
         '</tr></thead><tbody>' +
         rows.map(function (b) {
           return '<tr><td class="muted small">' + U.esc(b['BOM ID']) + '</td>' +
             '<td>' + U.esc(b['Chair Category']) + '</td><td class="small">' + U.esc(b['Sub Category'] || '') + '</td><td><b>' + U.esc(b['Model No / SKU']) + '</b></td>' +
             '<td>' + U.esc(b['Raw Material Code']) + '</td><td>' + U.esc(b['Raw Material Name']) + '</td>' +
+            '<td class="small">' + U.esc(b['Type'] || '') + '</td>' +
             '<td class="num">' + U.fmtQty(b['Qty Per Unit']) + '</td><td>' + U.esc(b['Unit']) + '</td>' +
             '<td class="rowactions">' +
             '  <button class="btn btn-sm" data-bedit="' + U.esc(b['BOM ID']) + '">✏️</button> ' +
@@ -1237,6 +1257,7 @@ window.VIEWS = (function () {
       '  <div class="field"><label>Model No / SKU</label><input name="Model No / SKU" value="' + U.esc(b['Model No / SKU']) + '"/></div>' +
       '  <div class="field"><label>Raw Material Code</label><input name="Raw Material Code" value="' + U.esc(b['Raw Material Code']) + '"/></div>' +
       '  <div class="field"><label>Raw Material Name</label><input name="Raw Material Name" value="' + U.esc(b['Raw Material Name']) + '"/></div>' +
+      '  <div class="field"><label>Type</label><input name="Type" value="' + U.esc(b['Type'] || '') + '"/></div>' +
       '  <div class="field"><label>Qty Per Unit</label><input name="Qty Per Unit" type="number" min="0" step="any" value="' + U.esc(b['Qty Per Unit']) + '"/></div>' +
       '  <div class="field"><label>Unit</label><select name="Unit">' + options(cfg.UNITS, String(b['Unit']).toUpperCase()) + '</select></div>' +
       '</form>',
