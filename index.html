@@ -1066,8 +1066,8 @@ window.VIEWS = (function () {
       '<div class="card">' +
       '<h2>🧩 Define Product Kitting (BOM) <span class="sub">Add all raw materials required to build one unit of a product. Category lists come live from the Masters tab of your Google Sheet.</span></h2>' +
       '<div class="frm" style="margin-bottom:10px">' +
-      '  <div class="field"><label>Chair Category *</label><select id="bomCat"><option value="">— select —</option>' + options(mCat()) + '</select></div>' +
-      '  <div class="field"><label>Sub Category</label><select id="bomSub"><option value="">— select —</option>' + options(mSub()) + '</select></div>' +
+      '  <div class="field"><label>Chair Category *</label><select id="bomCat"><option value="">— select —</option>' + options(mSub()) + '</select></div>' +
+      '  <div class="field"><label>Sub Category</label><select id="bomSub"><option value="">— select —</option>' + options(mCat()) + '</select></div>' +
       '  <div class="field"><label>Model No / SKU *</label><input id="bomProduct" placeholder="e.g. HIGH BACK CHAIR ya BOOMBLACK-1" /></div>' +
       '</div>' +
       '<div class="tablewrap"><table class="tbl" id="bomLines"><thead><tr>' +
@@ -1085,6 +1085,33 @@ window.VIEWS = (function () {
     var dl = '<datalist id="matCodes">' + invCodes.map(function (c) { return '<option value="' + U.esc(c) + '">'; }).join('') + '</datalist>';
     formCard.insertAdjacentHTML('beforeend', dl);
 
+    /* ---- Auto Raw Material Code (RM-0001 style, never repeats) ---- */
+    function usedCodes() {
+      var s = {};
+      (d.inventory || []).forEach(function (r) {
+        var c = String(r['Material Code'] || '').trim().toUpperCase();
+        if (c) s[c] = 1;
+      });
+      (d.bom || []).forEach(function (r) {
+        var c = String(r['Raw Material Code'] || '').trim().toUpperCase();
+        if (c) s[c] = 1;
+      });
+      formCard.querySelectorAll('#bomLines tbody tr .lc').forEach(function (inp) {
+        var c = String(inp.value || '').trim().toUpperCase();
+        if (c) s[c] = 1;
+      });
+      return s;
+    }
+    function nextRmCode() {
+      var used = usedCodes(), max = 0;
+      Object.keys(used).forEach(function (c) {
+        var m = /^RM-(\d+)$/.exec(c);
+        if (m) { var v = parseInt(m[1], 10); if (v > max) max = v; }
+      });
+      var n = max + 1, code;
+      do { code = 'RM-' + String(n).padStart(4, '0'); n++; } while (used[code]);
+      return code;
+    }
     function addLine() {
       var tr = el('<tr>' +
         '<td><input class="lc" list="matCodes" placeholder="RM-0001" style="width:100%;padding:6px 8px;border:1px solid var(--baseline);border-radius:7px;background:var(--surface);color:var(--ink)"/></td>' +
@@ -1093,6 +1120,7 @@ window.VIEWS = (function () {
         '<td><select class="lu" style="padding:6px 8px;border:1px solid var(--baseline);border-radius:7px;background:var(--surface);color:var(--ink)">' + options(cfg.UNITS, 'PCS') + '</select></td>' +
         '<td class="rowactions"><button class="btn btn-sm btn-danger rm">✕</button></td></tr>');
       tr.querySelector('.rm').onclick = function () { tr.remove(); };
+      tr.querySelector('.lc').value = nextRmCode();
       // auto-fill name/unit from inventory when a known code is chosen
       tr.querySelector('.lc').addEventListener('change', function () {
         var code = this.value.trim().toUpperCase();
