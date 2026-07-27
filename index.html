@@ -943,10 +943,10 @@ window.VIEWS = (function () {
 
     root.appendChild(el(
       '<div class="card">' +
-      '<h2>➕ Create New Order <span class="sub">Order ID blank = auto (ORD0552 style) · Specification ID blank = save date-time auto · same Order ID with multiple items allowed</span></h2>' +
+      '<h2>➕ Create New Order <span class="sub">Order ID blank = auto (ORD0552 style) · Specification ID auto = Save Order click ka timestamp · same Order ID with multiple items allowed</span></h2>' +
       '<form class="frm" id="orderForm">' +
       '  <div class="field"><label>ORDER ID (blank = auto)</label><input name="Order ID" placeholder="auto e.g. ORD0552" /></div>' +
-      '  <div class="field"><label>SPECIFICATION ID (blank = auto)</label><input name="Specification ID" placeholder="auto: save date-time" /></div>' +
+      '  <div class="field"><label>SPECIFICATION ID (auto)</label><input name="Specification ID" id="specStamp" readonly tabindex="-1" title="Save Order dabate hi timestamp apne aap capture ho jayega" style="background:var(--page);color:var(--ink-2);cursor:not-allowed" /></div>' +
       '  <div class="field"><label>CHAIR TYPE *</label><select name="Chair Type" required><option value="">— select —</option>' + options(mType()) + '</select></div>' +
       '  <div class="field"><label>CHAIR CATEGORY *</label><select name="Chair Category" required><option value="">— select —</option>' + options(mCat()) + '</select></div>' +
       '  <div class="field"><label>ITEM PIC</label><input name="Item Pic" placeholder="SPECIFICATION_IMAGES\\474.ITEM PIC.JPG" /></div>' +
@@ -964,10 +964,24 @@ window.VIEWS = (function () {
       '</form></div>'
     ));
 
+    /* SPECIFICATION ID is read-only - timestamp is captured when Save Order is clicked. */
+    function stamp() {
+      var t = new Date(), p = function (x) { return String(x).padStart(2, '0'); };
+      return t.getFullYear() + '-' + p(t.getMonth() + 1) + '-' + p(t.getDate()) +
+             ' ' + p(t.getHours()) + ':' + p(t.getMinutes()) + ':' + p(t.getSeconds());
+    }
+    var specBox = root.querySelector('#specStamp');
+    var specTimer = setInterval(function () {
+      if (!specBox || !document.body.contains(specBox)) { clearInterval(specTimer); return; }
+      specBox.value = stamp();
+    }, 1000);
+    if (specBox) specBox.value = stamp();
+
     root.querySelector('#orderForm').addEventListener('submit', async function (e) {
       e.preventDefault();
       var fd = new FormData(e.target), o = {};
       fd.forEach(function (v, k) { o[k] = v; });
+      o['Specification ID'] = stamp();   // exact moment the Save Order button was clicked
       var hasBom = ENGINE.bomForOrder(d.bom, o).length > 0;
       if (!hasBom && !confirm('No BOM found in Kitting Master for this SKU / Model No / Chair Category.\nKitting status will show "No BOM" until you add it.\n\nSave the order anyway?')) return;
       try {
@@ -1102,7 +1116,7 @@ window.VIEWS = (function () {
       '<div class="frm" style="margin-bottom:10px">' +
       '  <div class="field"><label>Chair Category *</label><select id="bomCat"><option value="">— select —</option>' + options(mSub()) + '</select></div>' +
       '  <div class="field"><label>Sub Category</label><select id="bomSub"><option value="">— select —</option>' + options(mCat()) + '</select></div>' +
-      '  <div class="field"><label>Model No / SKU *</label><input id="bomProduct" placeholder="e.g. HIGH BACK CHAIR ya BOOMBLACK-1" /></div>' +
+      '  <div class="field"><label>Model No / SKU</label><input id="bomProduct" placeholder="optional - blank rakho to Sub Category ka naam lag jayega" /></div>' +
       '</div>' +
       '<div class="notice" id="bomDupInfo" style="display:none"></div>' +
       '<div class="tablewrap"><table class="tbl" id="bomLines"><thead><tr>' +
@@ -1213,7 +1227,9 @@ window.VIEWS = (function () {
       var cat = formCard.querySelector('#bomCat').value,
           sub = formCard.querySelector('#bomSub').value,
           prod = formCard.querySelector('#bomProduct').value.trim();
-      if (!cat || !prod) return U.toast('Select a Chair Category and enter the Model No / SKU', 'bad');
+      if (!cat) return U.toast('Select a Chair Category first', 'bad');
+      // Model No / SKU is optional - blank means the BOM belongs to the whole Sub Category
+      if (!prod) prod = (sub || cat).trim();
       var items = [];
       formCard.querySelectorAll('#bomLines tbody tr').forEach(function (tr) {
         var code = tr.querySelector('.lc').value.trim(),
