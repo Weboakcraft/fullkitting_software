@@ -375,6 +375,14 @@ window.KMS_CONFIG = {
   SUB_CATEGORIES: ['Chair', 'Sofa', 'Wardrobe (Almirah)', 'Recliner Chair', 'Recliner Sofa', 'Bed', 'Table', 'Other'],
   // Standard raw-material lines auto-loaded when Chair Category = Chair
   CHAIR_PRESET_MATERIALS: ['Handle', 'Plate', 'Foam', 'Fabric', 'Base', 'Wheels', 'Hydraulic', 'Back Patta', 'Frame'],
+  // Auto-loaded raw-material lines per Chair Category (Kitting Master).
+  // Keys must be lower-case; the app matches the selected category in lower-case.
+  PRESET_MATERIALS_BY_CATEGORY: {
+    'sofa': ['Lakad', 'Foam', 'Fabric', 'Cottan', 'Hardware'],
+    'recliner chair': ['Lakad', 'Foam', 'Fabric', 'Hardware', 'Machine', 'Leg'],
+    'recliner sofa': ['Lakad', 'Foam', 'Fabric', 'Hardware', 'Machine', 'Leg'],
+    'table': ['Plyboard', 'Tape', 'Hardware', 'Key Lock', 'Channel']
+  },
   CHAIR_TYPES: ['CUSTOMIZED PRODUCT', 'EXISTING PRODUCT'],
   HANDLE_TYPES: ['FIXED HANDLE', 'U TYPE HANDLE', 'OLA HANDLE', 'BAR STOOL', 'WORKSTATION', '0'],
   FABRICS: ['LEATHER', 'LEATHER BLACK', 'MESH', 'BLACK MESH', 'BROWN', 'BLACK'],
@@ -1143,6 +1151,12 @@ window.VIEWS = (function () {
     function resetLines() {
       formCard.querySelector('#bomLines tbody').innerHTML = '';
       var cat = String(formCard.querySelector('#bomCat').value || '').trim().toLowerCase();
+      var byCat = cfg.PRESET_MATERIALS_BY_CATEGORY || {};
+      var catPreset = byCat[cat] || [];
+      if (catPreset.length) {
+        catPreset.forEach(function (nm) { addLine(nm); });
+        return;
+      }
       var preset = cfg.CHAIR_PRESET_MATERIALS || [];
       if (cat === 'chair' && preset.length) {
         preset.forEach(function (nm) { addLine(nm); });
