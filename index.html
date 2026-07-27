@@ -674,6 +674,28 @@ window.ENGINE = (function () {
     });
   }
 
+  /**
+   * BOM lines matched by category:
+   *   Order Form 'Chair Category'  ->  Kitting Master 'Sub Category'.
+   * Fill the Kitting Master once for a Sub Category and every order of that
+   * category picks the same BOM up automatically (FG Status / Full Kitting / PR).
+   */
+  function bomForSubCategory(bom, cat) {
+    var k = norm(cat);
+    if (!k) return [];
+    var rows = (bom || []).filter(function (b) { return norm(b['Sub Category']) === k; });
+    if (!rows.length) return [];
+    // If several products were saved under the same Sub Category, use the most
+    // recently defined one so material quantities are never counted twice.
+    var groups = {}, seen = [];
+    rows.forEach(function (b) {
+      var g = norm(b['Model No / SKU']);
+      if (!groups[g]) { groups[g] = []; seen.push(g); }
+      groups[g].push(b);
+    });
+    return groups[seen[seen.length - 1]];
+  }
+
   /** BOM lines for an order line: first key (SKU → Model No → Chair Category) that has a BOM wins. */
   function bomForOrder(bom, order) {
     var keys = orderKeys(order);
@@ -681,7 +703,8 @@ window.ENGINE = (function () {
       var lines = bomForKey(bom, keys[i]);
       if (lines.length) return lines;
     }
-    return [];
+    // nothing matched by SKU / Model No -> fall back to the category BOM
+    return bomForSubCategory(bom, order['Chair Category']);
   }
 
   /**
@@ -807,6 +830,7 @@ window.ENGINE = (function () {
   return {
     inventoryMap: inventoryMap,
     bomForKey: bomForKey,
+    bomForSubCategory: bomForSubCategory,
     bomForOrder: bomForOrder,
     orderKeys: orderKeys,
     orderLabel: orderLabel,
@@ -1080,6 +1104,7 @@ window.VIEWS = (function () {
       '  <div class="field"><label>Sub Category</label><select id="bomSub"><option value="">— select —</option>' + options(mCat()) + '</select></div>' +
       '  <div class="field"><label>Model No / SKU *</label><input id="bomProduct" placeholder="e.g. HIGH BACK CHAIR ya BOOMBLACK-1" /></div>' +
       '</div>' +
+      '<div class="notice" id="bomDupInfo" style="display:none"></div>' +
       '<div class="tablewrap"><table class="tbl" id="bomLines"><thead><tr>' +
       '<th>Raw Material Code *</th><th>Raw Material Name *</th><th>Type</th><th class="num">Qty / Unit *</th><th>Unit</th><th></th>' +
       '</tr></thead><tbody></tbody></table></div>' +
@@ -1166,6 +1191,23 @@ window.VIEWS = (function () {
     }
     formCard.querySelector('#bomCat').addEventListener('change', resetLines);
     resetLines();
+
+    /* Sub Category ka BOM pehle se saved hai? User ko bata do - dobara bharna zaroori nahi. */
+    function subCatInfo() {
+      var box = formCard.querySelector('#bomDupInfo');
+      var sub = String(formCard.querySelector('#bomSub').value || '').trim();
+      var rows = ENGINE.bomForSubCategory(d.bom, sub);
+      if (sub && rows.length) {
+        box.style.display = '';
+        box.innerHTML = '\u2705 <b>' + U.esc(sub) + '</b> ka BOM already saved hai (' + rows.length +
+          ' materials \u00b7 ' + U.esc(rows[0]['Model No / SKU'] || '') + '). Is category ke orders ka FG Status apne aap isi BOM se calculate hoga \u2014 dobara bharne ki zaroorat nahi.';
+      } else {
+        box.style.display = 'none';
+        box.innerHTML = '';
+      }
+    }
+    formCard.querySelector('#bomSub').addEventListener('change', subCatInfo);
+    subCatInfo();
 
     formCard.querySelector('#saveBom').onclick = async function () {
       var cat = formCard.querySelector('#bomCat').value,
