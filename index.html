@@ -2313,6 +2313,148 @@ window.APP = (function () {
   return { state: state, reload: reload, busy: busy, onSearch: onSearch, navigate: navigate };
 })();
 
+  /* ---------- ORDER FORM UI: Manual Order button + Order ID drilldown ---------- */
+  (function () {
+    if (typeof VIEWS === 'undefined' || !VIEWS || VIEWS.__oakOrdersUI) return;
+    VIEWS.__oakOrdersUI = true;
+
+    function clearNode(node) { while (node.firstChild) node.removeChild(node.firstChild); }
+
+    function tidy(root) {
+      var cards = root.querySelectorAll('.card');
+      if (cards.length < 2) return;
+      var formCard = cards[0];
+      var listCard = cards[1];
+      if (!formCard.querySelector('#orderForm')) return;
+
+      formCard.style.display = 'none';
+
+      var bar = document.createElement('div');
+      bar.style.display = 'flex';
+      bar.style.justifyContent = 'flex-end';
+      bar.style.alignItems = 'center';
+      bar.style.margin = '0 0 14px 0';
+
+      var btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'btn btn-primary';
+      btn.id = 'oakManualOrderBtn';
+      btn.textContent = '\u2795 Manual Order';
+      btn.onclick = function () {
+        var hidden = formCard.style.display === 'none';
+        formCard.style.display = hidden ? '' : 'none';
+        btn.textContent = hidden ? '\u2715 Close Form' : '\u2795 Manual Order';
+        if (hidden && formCard.scrollIntoView) formCard.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      };
+      bar.appendChild(btn);
+      root.insertBefore(bar, formCard);
+
+      var wrap = listCard.querySelector('#ordersTableWrap');
+      if (!wrap) return;
+      var busy = false;
+
+      function collapse() {
+        if (busy) return;
+        var orig = wrap.querySelector('table');
+        if (!orig || orig.getAttribute('data-oak') === '1') return;
+        busy = true;
+        try {
+          var headTr = orig.querySelector('thead tr');
+          var bodyRows = Array.prototype.slice.call(orig.querySelectorAll('tbody tr'));
+          var groups = [];
+          var map = {};
+          bodyRows.forEach(function (tr) {
+            var c0 = tr.querySelector('td');
+            var key = c0 ? (c0.textContent || '').trim() : '';
+            if (!key) key = '(no order id)';
+            if (!map[key]) { map[key] = { id: key, rows: [] }; groups.push(map[key]); }
+            map[key].rows.push(tr);
+          });
+
+          var tbl = document.createElement('table');
+          tbl.className = 'tbl';
+          tbl.setAttribute('data-oak', '1');
+          var thead = document.createElement('thead');
+          var htr = document.createElement('tr');
+          var hth = document.createElement('th');
+          hth.textContent = 'Order ID';
+          htr.appendChild(hth);
+          thead.appendChild(htr);
+          tbl.appendChild(thead);
+
+          var tbody = document.createElement('tbody');
+          groups.forEach(function (g) {
+            var tr = document.createElement('tr');
+            tr.style.cursor = 'pointer';
+            var td = document.createElement('td');
+            var arrow = document.createElement('span');
+            arrow.textContent = '\u25B8 ';
+            var name = document.createElement('b');
+            name.textContent = g.id;
+            var sub = document.createElement('span');
+            sub.className = 'sub';
+            sub.textContent = '   \u00b7  ' + g.rows.length + ' item' + (g.rows.length > 1 ? 's' : '');
+            td.appendChild(arrow);
+            td.appendChild(name);
+            td.appendChild(sub);
+            tr.appendChild(td);
+            tbody.appendChild(tr);
+
+            var dtr = document.createElement('tr');
+            dtr.style.display = 'none';
+            var dtd = document.createElement('td');
+            dtd.style.padding = '0';
+            dtr.appendChild(dtd);
+            tbody.appendChild(dtr);
+
+            var built = false;
+            tr.onclick = function () {
+              if (!built) {
+                built = true;
+                var inner = document.createElement('table');
+                inner.className = 'tbl';
+                var ith = document.createElement('thead');
+                if (headTr) ith.appendChild(headTr.cloneNode(true));
+                inner.appendChild(ith);
+                var itb = document.createElement('tbody');
+                g.rows.forEach(function (r) { itb.appendChild(r); });
+                inner.appendChild(itb);
+                var box = document.createElement('div');
+                box.className = 'tablewrap';
+                box.style.margin = '0';
+                box.appendChild(inner);
+                dtd.appendChild(box);
+              }
+              var open = dtr.style.display !== 'none';
+              dtr.style.display = open ? 'none' : '';
+              arrow.textContent = open ? '\u25B8 ' : '\u25BE ';
+            };
+          });
+          tbl.appendChild(tbody);
+          clearNode(wrap);
+          wrap.appendChild(tbl);
+        } catch (e) {
+          /* ignore */
+        } finally {
+          busy = false;
+        }
+      }
+
+      if (window.MutationObserver) {
+        var mo = new MutationObserver(function () { collapse(); });
+        mo.observe(wrap, { childList: true });
+      }
+      collapse();
+    }
+
+    var origRenderOrders = VIEWS.renderOrders;
+    VIEWS.renderOrders = function (root) {
+      origRenderOrders(root);
+      try { tidy(root); } catch (e) { }
+    };
+  })();
+
+
   </script>
 </body>
 </html>
