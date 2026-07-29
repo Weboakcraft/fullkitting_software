@@ -375,6 +375,18 @@ window.KMS_CONFIG = {
   SUB_CATEGORIES: ['Chair', 'Sofa', 'Wardrobe (Almirah)', 'Recliner Chair', 'Recliner Sofa', 'Bed', 'Table', 'Other'],
   // Standard raw-material lines auto-loaded when Chair Category = Chair
   CHAIR_PRESET_MATERIALS: ['Handle', 'Plate', 'Foam', 'Fabric', 'Base', 'Wheels', 'Hydraulic', 'Back Patta', 'Frame'],
+  // Kitting Master → "Type" dropdown lists. Live values come from the Masters
+  // tab (one column per raw material name); this is only the offline fallback.
+  BOM_TYPE_LISTS: {
+    'Handle': ['816 Handle', '817 Handle', '603 Handle', 'Sonic Handle', 'U Type Handle', 'Ola Handle Black', 'Ola Handle White', '3D Handle With Pu Pad White', '3D Handle With Pu Pad Black', '029 Handle', 'Curve Handle'],
+    'Plate': ['Single Lock', 'Multi Lock'],
+    'Foam': ['Foam', 'PU Foam'],
+    'Base': ['Spider Base', 'Mona Base', 'Bita Base', 'Nylone Black Base', 'Visitor Frame'],
+    'Wheels': ['Nylone Wheel', 'Alloy Wheels', 'Black and White Wheel'],
+    'Hydraulic': ['85 MM', '100 MM', '120 MM']
+  },
+  // Lists where "＋ Add other…" lets the user add a new option from inside the app.
+  BOM_TYPE_ADD_OTHER: ['Handle', 'Plate', 'Base', 'Wheels'],
   // Auto-loaded raw-material lines per Chair Category (Kitting Master).
   // Keys must be lower-case; the app matches the selected category in lower-case.
   PRESET_MATERIALS_BY_CATEGORY: {
@@ -454,7 +466,9 @@ window.API = (function () {
     updatePRStatus: function (prNumber, status) { return post('updatePRStatus', { prNumber: prNumber, status: status }); },
     deletePR: function (prNumber) { return post('deletePR', { prNumber: prNumber }); },
     // settings
-    saveSettings: function (settings) { return post('saveSettings', { settings: settings }); }
+    saveSettings: function (settings) { return post('saveSettings', { settings: settings }); },
+    // masters (dropdown lists)
+    addMasterValue: function (list, value) { return post('addMasterValue', { list: list, value: value }); }
   };
 })();
 
@@ -888,6 +902,25 @@ window.VIEWS = (function () {
   function mHandle() { return M('Handle Type', cfg.HANDLE_TYPES); }
   function mFabric() { return M('Fabric File & Code', cfg.FABRICS); }
 
+  /* --- Kitting Master "Type" dropdowns (lists live in the Masters tab) --- */
+  function bomTypeKey(name) {
+    var n = String(name || '').trim().toLowerCase();
+    if (!n) return '';
+    var base = Object.keys(cfg.BOM_TYPE_LISTS || {});
+    var keys = base.slice();
+    Object.keys(D().masters || {}).forEach(function (k) { if (keys.indexOf(k) === -1) keys.push(k); });
+    for (var i = 0; i < keys.length; i++) {
+      if (String(keys[i]).trim().toLowerCase() === n) return keys[i];
+    }
+    for (var j = 0; j < base.length; j++) {
+      var k = String(base[j]).toLowerCase().replace(/s$/, '');
+      if (new RegExp('(^|\\s)' + k + 's?(\\s|$)').test(n)) return base[j];
+    }
+    return '';
+  }
+  function bomTypeOptions(key) { return M(key, (cfg.BOM_TYPE_LISTS || {})[key] || []); }
+  function bomTypeCanAdd(key) { return (cfg.BOM_TYPE_ADD_OTHER || []).indexOf(key) !== -1; }
+
   /** Make a table sortable by clicking headers. */
   function makeSortable(table) {
     var ths = table.querySelectorAll('th[data-sort]');
@@ -1161,17 +1194,78 @@ window.VIEWS = (function () {
       do { code = 'RM-' + String(n).padStart(4, '0'); n++; } while (used[code]);
       return code;
     }
+    /* ---- "Type" cell: live dropdown for known raw materials ---- */
+    var CELLCSS = 'width:100%;padding:6px 8px;border:1px solid var(--baseline);border-radius:7px;background:var(--surface);color:var(--ink)';
+
+    function renderTypeCell(tr, forceValue) {
+      var cell = tr.querySelector('.ltcell');
+      var old = tr.querySelector('.lt');
+      var cur = (forceValue !== undefined && forceValue !== null) ? String(forceValue) : (old ? String(old.value || '') : '');
+      var key = bomTypeKey(tr.querySelector('.ln').value);
+      if (tr.__typeKey === key && forceValue === undefined) return;
+      tr.__typeKey = key;
+      if (!key) {
+        cell.innerHTML = '<input class="lt" placeholder="Type" style="' + CELLCSS + '"/>';
+        tr.querySelector('.lt').value = cur;
+        return;
+      }
+      var list = bomTypeOptions(key);
+      var extra = (cur && list.indexOf(cur) === -1) ? '<option value="' + U.esc(cur) + '">' + U.esc(cur) + '</option>' : '';
+      cell.innerHTML = '<select class="lt" style="' + CELLCSS + '">' +
+        '<option value="">— select ' + U.esc(key) + ' —</option>' + extra + options(list) +
+        (bomTypeCanAdd(key) ? '<option value="__ADD_OTHER__">＋ Add other…</option>' : '') +
+        '</select>';
+      var sel = tr.querySelector('.lt');
+      sel.value = cur;
+      sel.__prev = sel.value;
+      sel.addEventListener('change', function () {
+        if (sel.value !== '__ADD_OTHER__') { sel.__prev = sel.value; return; }
+        sel.value = sel.__prev || '';
+        addOtherTypeValue(key, tr);
+      });
+    }
+
+    /* Add a brand-new option - it is saved to the Masters tab, so it stays forever. */
+    async function addOtherTypeValue(key, tr) {
+      var name = window.prompt(key + ' ka naam likhein — ye list me hamesha ke liye save ho jayega:', '');
+      if (name === null) return;
+      name = String(name).trim();
+      if (!name) { U.toast('Name khali nahi ho sakta', 'bad'); return; }
+      var list = bomTypeOptions(key);
+      var have = list.some(function (v) { return String(v).toLowerCase() === name.toLowerCase(); });
+      if (!have) {
+        try {
+          U.toast('Saving "' + name + '" to Masters…');
+          var res = await API.addMasterValue(key, name);
+          var st = D();
+          st.masters = st.masters || {};
+          st.masters[key] = (res && res.values && res.values.length) ? res.values : list.concat([name]);
+          U.toast(name + ' added to the ' + key + ' list', 'good');
+        } catch (e) {
+          U.toast('Could not save: ' + (e && e.message ? e.message : e), 'bad');
+          return;
+        }
+      }
+      formCard.querySelectorAll('#bomLines tbody tr').forEach(function (row) {
+        var lt = row.querySelector('.lt');
+        renderTypeCell(row, row === tr ? name : (lt ? String(lt.value || '') : ''));
+      });
+    }
+
     function addLine(presetName) {
       var tr = el('<tr>' +
         '<td><input class="lc" readonly tabindex="-1" title="Auto-generated raw material code (locked)" placeholder="RM-0001" style="width:100%;padding:6px 8px;border:1px solid var(--baseline);border-radius:7px;background:var(--grid);color:var(--ink);cursor:not-allowed;font-weight:600"/></td>' +
-        '<td><input class="ln" placeholder="Material name" style="width:100%;padding:6px 8px;border:1px solid var(--baseline);border-radius:7px;background:var(--surface);color:var(--ink)"/></td>' +
-        '<td><input class="lt" placeholder="Type" style="width:100%;padding:6px 8px;border:1px solid var(--baseline);border-radius:7px;background:var(--surface);color:var(--ink)"/></td>' +
+        '<td><input class="ln" placeholder="Material name" style="' + CELLCSS + '"/></td>' +
+        '<td class="ltcell"></td>' +
         '<td><input class="lq num" type="number" min="0" step="any" placeholder="0" style="width:90px;padding:6px 8px;border:1px solid var(--baseline);border-radius:7px;background:var(--surface);color:var(--ink);text-align:right"/></td>' +
         '<td><select class="lu" style="padding:6px 8px;border:1px solid var(--baseline);border-radius:7px;background:var(--surface);color:var(--ink)">' + options(cfg.UNITS, 'PCS') + '</select></td>' +
         '<td class="rowactions"><button class="btn btn-sm btn-danger rm">✕</button></td></tr>');
       tr.querySelector('.rm').onclick = function () { tr.remove(); };
       tr.querySelector('.lc').value = nextRmCode();
       if (presetName) tr.querySelector('.ln').value = presetName;
+      renderTypeCell(tr);
+      tr.querySelector('.ln').addEventListener('input', function () { renderTypeCell(tr); });
+      tr.querySelector('.ln').addEventListener('change', function () { renderTypeCell(tr); });
       // auto-fill name/unit from inventory when a known code is chosen
       tr.querySelector('.lc').addEventListener('change', function () {
         var code = this.value.trim().toUpperCase();
@@ -1179,6 +1273,7 @@ window.VIEWS = (function () {
         if (inv) {
           tr.querySelector('.ln').value = inv['Material Name'] || '';
           if (inv['Unit']) tr.querySelector('.lu').value = String(inv['Unit']).toUpperCase();
+          renderTypeCell(tr);
         }
       });
       formCard.querySelector('#bomLines tbody').appendChild(tr);
@@ -2304,6 +2399,17 @@ window.APP = (function () {
       if (document.getElementById('modalRoot').innerHTML) return;
       var ae = document.activeElement;
       if (ae && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA' || ae.tagName === 'SELECT')) return;
+      // never wipe a Kitting Master (BOM) form the user has already started
+      var bomCatEl = document.getElementById('bomCat');
+      if (bomCatEl && String(bomCatEl.value || '').trim() !== '') return;
+      var bomBody = document.querySelector('#bomLines tbody');
+      if (bomBody) {
+        var bomDirty = false;
+        bomBody.querySelectorAll('.ln, .lt, .lq').forEach(function (x) {
+          if (String(x.value || '').trim() !== '') bomDirty = true;
+        });
+        if (bomDirty) return;
+      }
       reload(true);
     }, cfg.REFRESH_MS);
   }
