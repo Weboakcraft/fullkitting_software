@@ -2318,6 +2318,9 @@ window.APP = (function () {
     if (typeof VIEWS === 'undefined' || !VIEWS || VIEWS.__oakOrdersUI) return;
     VIEWS.__oakOrdersUI = true;
 
+    var OPEN = {};          /* order ids currently expanded - survives auto-refresh */
+    var FORM_OPEN = false;  /* Manual Order form visibility - survives auto-refresh */
+
     var DRIVE_THUMB = 'https://drive.google.com/thumbnail?id=';
 
     function clearNode(node) { while (node.firstChild) node.removeChild(node.firstChild); }
@@ -2413,7 +2416,7 @@ window.APP = (function () {
       var listCard = cards[1];
       if (!formCard.querySelector('#orderForm')) return;
 
-      formCard.style.display = 'none';
+      formCard.style.display = FORM_OPEN ? '' : 'none';
 
       var bar = document.createElement('div');
       bar.style.display = 'flex';
@@ -2425,10 +2428,11 @@ window.APP = (function () {
       btn.type = 'button';
       btn.className = 'btn btn-primary';
       btn.id = 'oakManualOrderBtn';
-      btn.textContent = '\u2795 Manual Order';
+      btn.textContent = FORM_OPEN ? '\u2715 Close Form' : '\u2795 Manual Order';
       btn.onclick = function () {
         var hidden = formCard.style.display === 'none';
         formCard.style.display = hidden ? '' : 'none';
+        FORM_OPEN = hidden;
         btn.textContent = hidden ? '\u2715 Close Form' : '\u2795 Manual Order';
         if (hidden && formCard.scrollIntoView) formCard.scrollIntoView({ behavior: 'smooth', block: 'start' });
       };
@@ -2502,27 +2506,31 @@ window.APP = (function () {
             tbody.appendChild(dtr);
 
             var built = false;
-            tr.onclick = function () {
-              if (!built) {
-                built = true;
-                var inner = document.createElement('table');
-                inner.className = 'tbl';
-                var ith = document.createElement('thead');
-                if (headTr) ith.appendChild(headTr.cloneNode(true));
-                inner.appendChild(ith);
-                var itb = document.createElement('tbody');
-                g.rows.forEach(function (r) { swapPic(r, picIdx, pmap); itb.appendChild(r); });
-                inner.appendChild(itb);
-                var box = document.createElement('div');
-                box.className = 'tablewrap';
-                box.style.margin = '0';
-                box.appendChild(inner);
-                dtd.appendChild(box);
-              }
-              var open = dtr.style.display !== 'none';
-              dtr.style.display = open ? 'none' : '';
-              arrow.textContent = open ? '\u25B8 ' : '\u25BE ';
-            };
+            function buildDetail() {
+              if (built) return;
+              built = true;
+              var inner = document.createElement('table');
+              inner.className = 'tbl';
+              var ith = document.createElement('thead');
+              if (headTr) ith.appendChild(headTr.cloneNode(true));
+              inner.appendChild(ith);
+              var itb = document.createElement('tbody');
+              g.rows.forEach(function (r) { swapPic(r, picIdx, pmap); itb.appendChild(r); });
+              inner.appendChild(itb);
+              var box = document.createElement('div');
+              box.className = 'tablewrap';
+              box.style.margin = '0';
+              box.appendChild(inner);
+              dtd.appendChild(box);
+            }
+            function setOpen(v) {
+              if (v) buildDetail();
+              dtr.style.display = v ? '' : 'none';
+              arrow.textContent = v ? '\u25BE ' : '\u25B8 ';
+              if (v) { OPEN[g.id] = 1; } else { delete OPEN[g.id]; }
+            }
+            tr.onclick = function () { setOpen(dtr.style.display === 'none'); };
+            if (OPEN[g.id]) setOpen(true);
           });
           tbl.appendChild(tbody);
           clearNode(wrap);
