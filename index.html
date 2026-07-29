@@ -432,12 +432,18 @@ window.API = (function () {
 
   async function post(action, payload) {
     assertConfigured();
-    var res = await fetch(cfg.API_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-      body: JSON.stringify({ action: action, payload: payload || {} })
-    });
-    return unwrap(await res.json());
+    // count writes in flight so a background refresh never runs in the middle of a save
+    window.__KMS_WRITES = (window.__KMS_WRITES || 0) + 1;
+    try {
+      var res = await fetch(cfg.API_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify({ action: action, payload: payload || {} })
+      });
+      return unwrap(await res.json());
+    } finally {
+      window.__KMS_WRITES = Math.max(0, (window.__KMS_WRITES || 1) - 1);
+    }
   }
 
   function unwrap(json) {
@@ -2037,10 +2043,14 @@ window.APP = (function () {
   async function reload(silent) {
     try {
       if (!silent) busy(true);
-      state.data = await API.bootstrap();
+      var fresh = await API.bootstrap();
+      state.data = fresh;
       state.loadedAt = new Date();
       setSyncInfo();
       updateCounts();
+      // the user may have started filling a form while this data was downloading —
+      // in that case keep the new data but never re-draw over the form
+      if (silent && formInUse()) { pauseSyncNote(); return; }
       render(); // re-render current view with fresh data
     } catch (err) {
       if (!silent) U.toast('Sync failed: ' + err.message, 'bad');
@@ -2069,7 +2079,78 @@ window.APP = (function () {
     render();
   }
 
+  /* ---------------- form protection (a refresh must never reset a form) ---------------- */
+  // view-filter controls only: they hold no typed data, so they are simply re-applied after a re-render
+  var FILTER_IDS = ['fStatus', 'fCat', 'fType', 'bfCat', 'bfSub', 'bfProd', 'fgOrder', 'lowOnly', 'kFilter'];
+
+  function ctlList(root) {
+    return Array.prototype.slice.call((root || document).querySelectorAll('input, select, textarea'));
+  }
+  function ctlVal(x) { return (x.type === 'checkbox' || x.type === 'radio') ? x.checked : x.value; }
+
+  // snapshot of every field right after a render — anything different later was changed by the user
+  function baselineForms() {
+    ctlList(document.getElementById('content')).forEach(function (x) { x.__base = ctlVal(x); });
+  }
+
+  function pauseSyncNote() {
+    var si = document.getElementById('syncInfo');
+    if (si && si.textContent.indexOf('paused') < 0) {
+      si.textContent = si.textContent.split(' · ')[0] + ' · sync paused (form open)';
+    }
+  }
+
+  // true whenever something is in progress that a refresh would destroy
+  function formInUse() {
+    if (window.__KMS_WRITES > 0) return true;                 // a save / submit is in flight
+    var mr = document.getElementById('modalRoot');
+    if (mr && mr.innerHTML) return true;                      // a modal form is open
+    var ae = document.activeElement;
+    if (ae && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA' || ae.tagName === 'SELECT')) return true;
+    var dirty = false;
+    ctlList(document.getElementById('content')).forEach(function (x) {
+      if (dirty || x.disabled || x.readOnly || FILTER_IDS.indexOf(x.id) >= 0) return;
+      var v = ctlVal(x);
+      if (x.__base === undefined) {                           // field added after the render (e.g. a new BOM line)
+        if (v === true || (typeof v === 'string' && v.trim() !== '')) dirty = true;
+        return;
+      }
+      if (v !== x.__base) dirty = true;                       // the user edited this field
+    });
+    return dirty;
+  }
+
+  // keep filter selections + scroll position across a re-render
+  function snapFilters() {
+    var root = document.getElementById('content');
+    var snap = { view: root ? (root.dataset.rendered || '') : '', vals: {}, y: window.pageYOffset || 0 };
+    if (!root) return snap;
+    FILTER_IDS.forEach(function (id) {
+      var x = root.querySelector('#' + id);
+      if (x) snap.vals[id] = ctlVal(x);
+    });
+    return snap;
+  }
+  function restoreFilters(snap, view) {
+    if (!snap || snap.view !== view) return;
+    var root = document.getElementById('content');
+    if (!root) return;
+    Object.keys(snap.vals).forEach(function (id) {
+      var x = root.querySelector('#' + id), v = snap.vals[id];
+      if (!x) return;
+      if (x.type === 'checkbox' || x.type === 'radio') {
+        if (v === true && x.checked !== true) { x.checked = true; x.dispatchEvent(new Event('change')); }
+        return;
+      }
+      if (!v || x.value === v) return;
+      var ok = !x.options || Array.prototype.some.call(x.options, function (o) { return o.value === v; });
+      if (ok) { x.value = v; x.dispatchEvent(new Event('change')); }
+    });
+    if (snap.y) { try { window.scrollTo(0, snap.y); } catch (e) {} }
+  }
+
   function render() {
+    var keep = snapFilters();
     charts.forEach(function (c) { try { c.destroy(); } catch (e) {} });
     charts = [];
     state.searchHandlers = [];
@@ -2085,6 +2166,9 @@ window.APP = (function () {
     else if (v === 'pr') VIEWS.renderPr(root);
     else if (v === 'reports') renderReports(root);
     else if (v === 'settings') VIEWS.renderSettings(root);
+    root.dataset.rendered = v;
+    restoreFilters(keep, v);
+    baselineForms();
   }
 
   function onSearch(fn) { state.searchHandlers.push(fn); }
@@ -2390,26 +2474,13 @@ window.APP = (function () {
 
     // instant re-sync when the user returns to this browser tab
     document.addEventListener('visibilitychange', function () {
-      if (!document.hidden) reload(true);
+      if (!document.hidden && !formInUse()) reload(true);
     });
 
     // background auto-refresh (real-time sync with Google Sheets)
     setInterval(function () {
-      // don't clobber the UI while a modal / form is in use
-      if (document.getElementById('modalRoot').innerHTML) return;
-      var ae = document.activeElement;
-      if (ae && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA' || ae.tagName === 'SELECT')) return;
-      // never wipe a Kitting Master (BOM) form the user has already started
-      var bomCatEl = document.getElementById('bomCat');
-      if (bomCatEl && String(bomCatEl.value || '').trim() !== '') return;
-      var bomBody = document.querySelector('#bomLines tbody');
-      if (bomBody) {
-        var bomDirty = false;
-        bomBody.querySelectorAll('.ln, .lt, .lq').forEach(function (x) {
-          if (String(x.value || '').trim() !== '') bomDirty = true;
-        });
-        if (bomDirty) return;
-      }
+      // never clobber a form in progress: typing, an open modal, a started BOM or a save in flight
+      if (formInUse()) { pauseSyncNote(); return; }
       reload(true);
     }, cfg.REFRESH_MS);
   }
