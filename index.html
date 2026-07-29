@@ -1042,8 +1042,8 @@ window.VIEWS = (function () {
             '<td class="num">' + U.fmtQty(o['Ordered Qty']) + '</td>' +
             '<td>' + U.orderStatusPill(String(o['Order Status'] || 'Open')) + '</td>' +
             '<td class="rowactions">' +
-            '  <button class="btn btn-sm" data-edit="' + o._row + '">✏️</button> ' +
-            '  <button class="btn btn-sm btn-danger" data-del="' + o._row + '" data-oid="' + U.esc(o['Order ID']) + '">🗑</button>' +
+            '  <button class="btn btn-sm" disabled title="Editing is disabled - orders are managed in the Google Sheet" style="opacity:.4;cursor:not-allowed">✏️</button> ' +
+            '  <button class="btn btn-sm btn-danger" disabled title="Deleting is disabled - orders are managed in the Google Sheet" style="opacity:.4;cursor:not-allowed">🗑</button>' +
             '</td></tr>';
         }).join('') + '</tbody></table>';
       makeSortable(wrap.querySelector('table'));
@@ -1163,7 +1163,7 @@ window.VIEWS = (function () {
     }
     function addLine(presetName) {
       var tr = el('<tr>' +
-        '<td><input class="lc" list="matCodes" placeholder="RM-0001" style="width:100%;padding:6px 8px;border:1px solid var(--baseline);border-radius:7px;background:var(--surface);color:var(--ink)"/></td>' +
+        '<td><input class="lc" readonly tabindex="-1" title="Auto-generated raw material code (locked)" placeholder="RM-0001" style="width:100%;padding:6px 8px;border:1px solid var(--baseline);border-radius:7px;background:var(--grid);color:var(--ink);cursor:not-allowed;font-weight:600"/></td>' +
         '<td><input class="ln" placeholder="Material name" style="width:100%;padding:6px 8px;border:1px solid var(--baseline);border-radius:7px;background:var(--surface);color:var(--ink)"/></td>' +
         '<td><input class="lt" placeholder="Type" style="width:100%;padding:6px 8px;border:1px solid var(--baseline);border-radius:7px;background:var(--surface);color:var(--ink)"/></td>' +
         '<td><input class="lq num" type="number" min="0" step="any" placeholder="0" style="width:90px;padding:6px 8px;border:1px solid var(--baseline);border-radius:7px;background:var(--surface);color:var(--ink);text-align:right"/></td>' +
