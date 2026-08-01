@@ -1397,29 +1397,41 @@ window.VIEWS = (function () {
       });
       var wrap = listCard.querySelector('#bomTableWrap');
       if (!rows.length) { wrap.innerHTML = '<div class="empty">No BOM lines yet. Define your first product above.</div>'; return; }
+      // One row per product (Model / SKU) — full material list opens in Details.
+      var groups = [], gmap = {};
+      rows.forEach(function (b) {
+        var key = [b['Model No / SKU'], b['Sub Category'], b['Chair Category']]
+          .map(function (v) { return String(v == null ? '' : v).trim().toUpperCase(); }).join(' || ');
+        if (!gmap[key]) {
+          gmap[key] = {
+            product: b['Model No / SKU'] || '—',
+            cat: b['Chair Category'] || '',
+            sub: b['Sub Category'] || '',
+            lines: []
+          };
+          groups.push(gmap[key]);
+        }
+        gmap[key].lines.push(b);
+      });
+
       wrap.innerHTML =
         '<table class="tbl"><thead><tr>' +
-        '<th data-sort>BOM ID</th><th data-sort>Chair Category</th><th data-sort>Sub Category</th><th data-sort>Model / SKU</th><th data-sort>Material Code</th>' +
-        '<th data-sort>Material Name</th><th data-sort>Type</th><th data-sort class="num">Qty / Unit</th><th data-sort>Unit</th><th></th>' +
+        '<th data-sort>Model / SKU</th><th data-sort>Chair Category</th><th data-sort>Sub Category</th>' +
+        '<th data-sort class="num">Materials</th><th data-sort>BOM IDs</th><th></th>' +
         '</tr></thead><tbody>' +
-        rows.map(function (b) {
-          return '<tr><td class="muted small">' + U.esc(b['BOM ID']) + '</td>' +
-            '<td>' + U.esc(b['Chair Category']) + '</td><td class="small">' + U.esc(b['Sub Category'] || '') + '</td><td><b>' + U.esc(b['Model No / SKU']) + '</b></td>' +
-            '<td>' + U.esc(b['Raw Material Code']) + '</td><td>' + U.esc(b['Raw Material Name']) + '</td>' +
-            '<td class="small">' + U.esc(b['Type'] || '') + '</td>' +
-            '<td class="num">' + U.fmtQty(b['Qty Per Unit']) + '</td><td>' + U.esc(b['Unit']) + '</td>' +
-            '<td class="rowactions">' +
-            '  <button class="btn btn-sm" data-bedit="' + U.esc(b['BOM ID']) + '">✏️</button> ' +
-            '  <button class="btn btn-sm btn-danger" data-bdel="' + U.esc(b['BOM ID']) + '">🗑</button></td></tr>';
+        groups.map(function (g, i) {
+          var ids = g.lines.length > 1
+            ? g.lines[0]['BOM ID'] + ' … ' + g.lines[g.lines.length - 1]['BOM ID']
+            : g.lines[0]['BOM ID'];
+          return '<tr><td><b>' + U.esc(g.product) + '</b></td>' +
+            '<td>' + U.esc(g.cat) + '</td><td class="small">' + U.esc(g.sub) + '</td>' +
+            '<td class="num">' + g.lines.length + '</td>' +
+            '<td class="muted small">' + U.esc(ids) + '</td>' +
+            '<td class="rowactions"><button class="btn btn-sm" data-bomdetail="' + i + '">Details</button></td></tr>';
         }).join('') + '</tbody></table>';
       makeSortable(wrap.querySelector('table'));
-      wrap.querySelectorAll('[data-bedit]').forEach(function (b) { b.onclick = function () { editBomModal(b.dataset.bedit); }; });
-      wrap.querySelectorAll('[data-bdel]').forEach(function (b) {
-        b.onclick = async function () {
-          if (!confirm('Delete BOM line ' + b.dataset.bdel + '?')) return;
-          try { APP.busy(true); await API.deleteBomItem(b.dataset.bdel); U.toast('BOM line deleted', 'good'); await APP.reload(); }
-          catch (err) { U.toast(err.message, 'bad'); } finally { APP.busy(false); }
-        };
+      wrap.querySelectorAll('[data-bomdetail]').forEach(function (btn) {
+        btn.onclick = function () { bomDetailModal(groups[Number(btn.dataset.bomdetail)]); };
       });
     }
     ['bfCat', 'bfSub', 'bfProd'].forEach(function (id) { listCard.querySelector('#' + id).addEventListener('change', drawBom); });
@@ -1434,6 +1446,37 @@ window.VIEWS = (function () {
     };
     drawBom();
     APP.onSearch(drawBom);
+  }
+
+  /** All material lines of one Kitting Master product (opened by the Details button). */
+  function bomDetailModal(g) {
+    openModal('Kitting Master — ' + (g.product || '—') + ' · ' + g.lines.length + ' materials',
+      '<div class="tablewrap"><table class="tbl"><thead><tr>' +
+      '<th>BOM ID</th><th>Material Code</th><th>Material Name</th><th>Type</th><th class="num">Qty / Unit</th><th>Unit</th><th></th>' +
+      '</tr></thead><tbody>' +
+      g.lines.map(function (b) {
+        return '<tr><td class="muted small">' + U.esc(b['BOM ID']) + '</td>' +
+          '<td>' + U.esc(b['Raw Material Code']) + '</td><td>' + U.esc(b['Raw Material Name']) + '</td>' +
+          '<td class="small">' + U.esc(b['Type'] || '') + '</td>' +
+          '<td class="num">' + U.fmtQty(b['Qty Per Unit']) + '</td><td>' + U.esc(b['Unit']) + '</td>' +
+          '<td class="rowactions">' +
+          '  <button class="btn btn-sm" data-bedit="' + U.esc(b['BOM ID']) + '">✏️</button> ' +
+          '  <button class="btn btn-sm btn-danger" data-bdel="' + U.esc(b['BOM ID']) + '">🗑</button></td></tr>';
+      }).join('') + '</tbody></table></div>',
+      '<button class="btn" id="mCancel">Close</button>'
+    );
+    document.getElementById('mCancel').onclick = closeModal;
+    var body = document.getElementById('modalBody');
+    body.querySelectorAll('[data-bedit]').forEach(function (b) {
+      b.onclick = function () { editBomModal(b.dataset.bedit); };
+    });
+    body.querySelectorAll('[data-bdel]').forEach(function (b) {
+      b.onclick = async function () {
+        if (!confirm('Delete BOM line ' + b.dataset.bdel + '?')) return;
+        try { APP.busy(true); await API.deleteBomItem(b.dataset.bdel); closeModal(); U.toast('BOM line deleted', 'good'); await APP.reload(); }
+        catch (err) { U.toast(err.message, 'bad'); } finally { APP.busy(false); }
+      };
+    });
   }
 
   function editBomModal(bomId) {
