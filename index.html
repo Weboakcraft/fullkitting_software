@@ -378,9 +378,9 @@ window.KMS_CONFIG = {
   SUB_CATEGORIES: ['Chair', 'Sofa', 'Wardrobe (Almirah)', 'Recliner Chair', 'Recliner Sofa', 'Bed', 'Table', 'Other'],
   // Standard raw-material lines auto-loaded when Chair Category = Chair
   CHAIR_PRESET_MATERIALS: ['Handle', 'Plate', 'Foam', 'Fabric', 'Base', 'Wheels', 'Hydraulic', 'Back Patta', 'Frame', 'Tower Bally', 'Ply', 'Hardware'],
-  // Raw materials whose "Type" dropdown is filled LIVE from the Inventory sheet
-  // (Inventory column C = category, column B = the value shown in the dropdown).
-  INVENTORY_TYPE_MATERIALS: ['Tower Bally', 'Ply', 'Fabric', 'Hardware'],
+  // Raw materials whose "Type" box is a tick-box list (multiple items can be
+  // selected). Values come from the same Inventory Category (col C) match.
+  BOM_MULTI_SELECT_MATERIALS: ['Hardware'],
   // Kitting Master → "Type" dropdown lists. Live values come from the Masters
   // tab (one column per raw material name); this is only the offline fallback.
   BOM_TYPE_LISTS: {
@@ -979,20 +979,21 @@ window.VIEWS = (function () {
     }
     rows.forEach(function (r) { if (invNorm(r['Category']) === n) push(r['Material Name'] || r['Material Code']); });
     if (!out.length) {
-      /* Category column still blank in the sheet? Then fall back to inventory
-         items whose own name contains that word - only for the materials
-         listed in INVENTORY_TYPE_MATERIALS, so other rows keep their lists. */
-      var allow = (cfg.INVENTORY_TYPE_MATERIALS || []).some(function (m) { return invNorm(m) === n; });
-      if (allow) {
-        var re = new RegExp('(^|\\s)' + n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '(\\s|$)');
-        rows.forEach(function (r) {
-          var nm = String(r['Material Name'] || r['Material Code'] || '').trim();
-          if (re.test(invNorm(nm))) push(nm);
-        });
-      }
+      /* Category column abhi blank hai? Tab tak fall back: inventory ke wo items
+         jinke apne naam me yahi word aata hai, taaki list khali na rahe. */
+      var re = new RegExp('(^|\\s)' + n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '(\\s|$)');
+      rows.forEach(function (r) {
+        var nm = String(r['Material Name'] || r['Material Code'] || '').trim();
+        if (re.test(invNorm(nm))) push(nm);
+      });
     }
     out.sort(function (a, b) { return String(a).localeCompare(String(b)); });
     return out;
+  }
+  /* Raw materials whose Type box is a tick-box (multi select) list. */
+  function bomIsMulti(name) {
+    var n = invNorm(name);
+    return (cfg.BOM_MULTI_SELECT_MATERIALS || []).some(function (m) { return invNorm(m) === n; });
   }
 
   /** Make a table sortable by clicking headers. */
@@ -1278,16 +1279,18 @@ window.VIEWS = (function () {
       var rawName = String(tr.querySelector('.ln').value || '').trim();
       var key = bomTypeKey(rawName);
       var invList = invTypeOptions(rawName);
-      var sig = key + '#' + invNorm(rawName) + '#' + invList.length;
+      var isMulti = bomIsMulti(rawName);
+      var sig = key + '#' + invNorm(rawName) + '#' + invList.length + '#' + (isMulti ? 'M' : 'S');
       if (tr.__typeKey === sig && forceValue === undefined) return;
       tr.__typeKey = sig;
-      if (!key && !invList.length) {
+      var list = invList.length ? invList : bomTypeOptions(key);
+      var label = key || rawName;
+      if (isMulti) { renderTypeChecks(tr, cell, list, cur, label); return; }
+      if (!list.length) {
         cell.innerHTML = '<input class="lt" placeholder="Type" style="' + CELLCSS + '"/>';
         tr.querySelector('.lt').value = cur;
         return;
       }
-      var list = invList.length ? invList : bomTypeOptions(key);
-      var label = key || rawName;
       var canAdd = !invList.length && bomTypeCanAdd(key);
       var extra = (cur && list.indexOf(cur) === -1) ? '<option value="' + U.esc(cur) + '">' + U.esc(cur) + '</option>' : '';
       cell.innerHTML = '<select class="lt" style="' + CELLCSS + '">' +
@@ -1302,6 +1305,77 @@ window.VIEWS = (function () {
         sel.value = sel.__prev || '';
         addOtherTypeValue(key, tr);
       });
+    }
+
+    /* Tick-box (multi select) Type box - more than one item can be picked.
+       Same source as the dropdowns: Inventory sheet, Category column (C). */
+    function renderTypeChecks(tr, cell, list, cur, label) {
+      var chosen = String(cur || '').split(',').map(function (s) { return s.trim(); }).filter(Boolean);
+      var all = list.slice();
+      chosen.forEach(function (c) { if (!all.some(function (v) { return invNorm(v) === invNorm(c); })) all.push(c); });
+      cell.innerHTML =
+        '<div class="ltm" style="position:relative">' +
+        '<input type="hidden" class="lt" />' +
+        '<button type="button" class="ltmbtn" style="' + CELLCSS + ';text-align:left;cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></button>' +
+        '<div class="ltmpanel" style="display:none;position:absolute;left:0;top:calc(100% + 4px);z-index:90;min-width:280px;max-height:250px;overflow:auto;background:var(--surface);border:1px solid var(--baseline);border-radius:9px;box-shadow:0 10px 26px rgba(0,0,0,.18);padding:8px"></div>' +
+        '</div>';
+      var box = cell.querySelector('.ltm');
+      var hid = cell.querySelector('.lt');
+      var btn = cell.querySelector('.ltmbtn');
+      var pan = cell.querySelector('.ltmpanel');
+      function sync() {
+        var v = [].slice.call(pan.querySelectorAll('input.ltmc:checked')).map(function (c) { return c.value; });
+        hid.value = v.join(', ');
+        btn.textContent = v.length ? (v.length + ' selected — ' + v.join(', ')) : ('— select ' + label + ' —');
+        btn.title = hid.value;
+      }
+      function addRow(v, on) {
+        var row = document.createElement('label');
+        row.style.cssText = 'display:flex;gap:8px;align-items:center;padding:4px 6px;border-radius:6px;cursor:pointer;font-size:13px';
+        var cb = document.createElement('input');
+        cb.type = 'checkbox'; cb.className = 'ltmc'; cb.value = v; cb.checked = !!on;
+        cb.addEventListener('change', sync);
+        var sp = document.createElement('span');
+        sp.textContent = v;
+        row.appendChild(cb); row.appendChild(sp);
+        pan.appendChild(row);
+        return row;
+      }
+      if (!all.length) {
+        var hint = document.createElement('div');
+        hint.style.cssText = 'font-size:12px;color:var(--muted);padding:4px 6px;line-height:1.45';
+        hint.textContent = 'Inventory sheet ke Category column (C) me "' + label + '" likhiye - wahan se list apne aap yahan aa jayegi.';
+        pan.appendChild(hint);
+      }
+      all.forEach(function (v) { addRow(v, chosen.some(function (c) { return invNorm(c) === invNorm(v); })); });
+      var addBar = document.createElement('div');
+      addBar.style.cssText = 'display:flex;gap:6px;margin-top:6px;border-top:1px solid var(--grid);padding-top:6px';
+      var inp = document.createElement('input');
+      inp.placeholder = 'Add manually…';
+      inp.style.cssText = 'flex:1;min-width:0;padding:5px 7px;border:1px solid var(--baseline);border-radius:7px;background:var(--surface);color:var(--ink);font-size:13px';
+      var ab = document.createElement('button');
+      ab.type = 'button'; ab.className = 'btn btn-sm'; ab.textContent = 'Add';
+      ab.onclick = function () {
+        var v = String(inp.value || '').trim();
+        if (!v) return;
+        inp.value = '';
+        var row = addRow(v, true);
+        pan.insertBefore(row, addBar);
+        sync();
+      };
+      addBar.appendChild(inp); addBar.appendChild(ab);
+      pan.appendChild(addBar);
+      btn.onclick = function (e) {
+        e.preventDefault(); e.stopPropagation();
+        pan.style.display = (pan.style.display === 'none') ? 'block' : 'none';
+      };
+      pan.addEventListener('click', function (e) { e.stopPropagation(); });
+      var away = function (e) {
+        if (!box.isConnected) { document.removeEventListener('click', away); return; }
+        if (!box.contains(e.target)) pan.style.display = 'none';
+      };
+      document.addEventListener('click', away);
+      sync();
     }
 
     /* Add a brand-new option - it is saved to the Masters tab, so it stays forever. */
