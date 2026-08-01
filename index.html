@@ -664,6 +664,15 @@ window.ENGINE = (function () {
   function n(v) { var x = Number(v); return isNaN(x) ? 0 : x; }
   function norm(v) { return String(v == null ? '' : v).trim().toLowerCase(); }
 
+  /**
+   * Key used to match a Kitting Master line with a Live Inventory row.
+   * Case- and space-insensitive: 'ola handle black', 'Ola Handle Black' and
+   * 'OLA  HANDLE BLACK' are all treated as the same item. Spelling must match.
+   */
+  function invKey(v) {
+    return String(v == null ? '' : v).trim().toUpperCase().replace(/\s+/g, ' ');
+  }
+
   /** The key used to find this order line's BOM. */
   function orderKeys(order) {
     return [order['SKU'], order['Model No'], order['Chair Category']]
@@ -677,11 +686,14 @@ window.ENGINE = (function () {
 
   function orderQty(order) { return n(order['Ordered Qty']); }
 
-  /** Map of Material Code -> inventory row */
+  /** Map of Material Code AND Material Name -> inventory row (case/space-insensitive). */
   function inventoryMap(inventory) {
     var map = {};
     (inventory || []).forEach(function (r) {
-      map[String(r['Material Code']).trim().toUpperCase()] = r;
+      var code = invKey(r['Material Code']);
+      var name = invKey(r['Material Name']);
+      if (code && !map[code]) map[code] = r;
+      if (name && !map[name]) map[name] = r;
     });
     return map;
   }
@@ -740,6 +752,7 @@ window.ENGINE = (function () {
         productName: orderLabel(order),
         materialCode: String(b['Raw Material Code'] || '').trim(),
         materialName: b['Raw Material Name'] || '',
+        materialType: String(b['Type'] || '').trim(),
         perUnit: n(b['Qty Per Unit']),
         requiredQty: n(b['Qty Per Unit']) * qty,
         unit: b['Unit'] || ''
@@ -765,14 +778,15 @@ window.ENGINE = (function () {
 
     var okCount = 0;
     var lines = reqs.map(function (r) {
-      var inv = invMap[r.materialCode.toUpperCase()];
+      var inv = invMap[invKey(r.materialType)] || invMap[invKey(r.materialName)] || invMap[invKey(r.materialCode)];
       var avail = inv ? n(inv['Available Qty']) : 0;
       var shortage = Math.max(0, r.requiredQty - avail);
       var ok = shortage <= 0;
       if (ok) okCount++;
       return {
         orderId: r.orderId, orderRow: r.orderRow, productName: r.productName,
-        materialCode: r.materialCode, materialName: r.materialName || (inv ? inv['Material Name'] : ''),
+        materialCode: r.materialCode, materialType: r.materialType || '',
+        materialName: r.materialName || (inv ? inv['Material Name'] : ''),
         perUnit: r.perUnit, requiredQty: r.requiredQty,
         availableQty: avail, shortageQty: shortage,
         unit: r.unit || (inv ? inv['Unit'] : ''), ok: ok, inStockRecord: !!inv
@@ -801,10 +815,11 @@ window.ENGINE = (function () {
     var agg = {};
     evaluations.forEach(function (ev) {
       ev.result.shortages.forEach(function (s) {
-        var key = s.materialCode.toUpperCase();
+        var key = invKey(s.materialType || s.materialName || s.materialCode);
         if (!agg[key]) {
           agg[key] = {
-            materialCode: s.materialCode, materialName: s.materialName, unit: s.unit,
+            materialCode: s.materialCode, materialType: s.materialType || '',
+            materialName: s.materialType || s.materialName, unit: s.unit,
             requiredQty: 0, availableQty: s.availableQty, shortageQty: 0,
             orders: [], products: []
           };
@@ -825,8 +840,8 @@ window.ENGINE = (function () {
     (orders || []).forEach(function (o) {
       if (filterFn && !filterFn(o)) return;
       orderRequirements(o, bom).forEach(function (r) {
-        var key = r.materialCode.toUpperCase();
-        if (!agg[key]) agg[key] = { materialCode: r.materialCode, materialName: r.materialName, unit: r.unit, qty: 0 };
+        var key = invKey(r.materialType || r.materialName || r.materialCode);
+        if (!agg[key]) agg[key] = { materialCode: r.materialCode, materialType: r.materialType || '', materialName: r.materialType || r.materialName, unit: r.unit, qty: 0 };
         agg[key].qty += r.requiredQty;
       });
     });
@@ -848,6 +863,7 @@ window.ENGINE = (function () {
   }
 
   return {
+    invKey: invKey,
     inventoryMap: inventoryMap,
     bomForKey: bomForKey,
     bomForSubCategory: bomForSubCategory,
@@ -1552,7 +1568,7 @@ window.VIEWS = (function () {
     var demand = {};
     ENGINE.evaluateAll(d.orders, d.bom, d.inventory).forEach(function (ev) {
       ev.result.lines.forEach(function (l) {
-        var k = l.materialCode.toUpperCase();
+        var k = ENGINE.invKey(l.materialType || l.materialName || l.materialCode);
         demand[k] = (demand[k] || 0) + l.requiredQty;
       });
     });
@@ -1576,7 +1592,7 @@ window.VIEWS = (function () {
         '</tr></thead><tbody>' +
         rows.map(function (r) {
           var qty = U.num(r['Available Qty']), min = U.num(r['Min Stock Level']);
-          var dem = demand[String(r['Material Code']).toUpperCase()] || 0;
+      var dem = demand[ENGINE.invKey(r['Material Code'])] || 0;
           var health;
           if (qty <= 0) health = U.pill('Out of stock', 'bad');
           else if (dem > qty) health = U.pill('Below demand', 'warn');
@@ -1710,7 +1726,7 @@ window.VIEWS = (function () {
         '<th>Code</th><th>Material</th><th class="num">Required</th><th class="num">Available</th><th class="num">Shortage</th><th>Unit</th><th>Status</th>' +
         '</tr></thead><tbody>' +
         r.lines.map(function (l) {
-          return '<tr><td>' + U.esc(l.materialCode) + '</td><td>' + U.esc(l.materialName) + '</td>' +
+          return '<tr><td>' + U.esc(l.materialCode) + '</td><td>' + U.esc(l.materialType || l.materialName) + '</td>' +
             '<td class="num">' + U.fmtQty(l.requiredQty) + '</td><td class="num">' + U.fmtQty(l.availableQty) + '</td>' +
             '<td class="num">' + (l.shortageQty ? '<b style="color:var(--critical)">' + U.fmtQty(l.shortageQty) + '</b>' : '—') + '</td>' +
             '<td>' + U.esc(l.unit) + '</td>' +
