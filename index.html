@@ -296,11 +296,14 @@ table.tbl { width: 100%; border-collapse: collapse; font-size: 13px; }
 
 </style>
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#129521;</text></svg>" />
+  <link rel="preconnect" href="https://script.google.com" crossorigin />
+  <link rel="preconnect" href="https://script.googleusercontent.com" crossorigin />
+  <link rel="dns-prefetch" href="https://script.google.com" />
   <!-- Libraries (CDN) -->
-  <script src="https://cdn.jsdelivr.net/npm/chart.js/dist/chart.umd.min.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/chart.js/dist/chart.umd.min.js"></script>
+  <script defer src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+  <script defer src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js"></script>
+  <script defer src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 </head>
 <body>
 
@@ -476,6 +479,16 @@ window.API = (function () {
     // masters (dropdown lists)
     addMasterValue: function (list, value) { return post('addMasterValue', { list: list, value: value }); }
   };
+})();
+
+/* Start the first Google Sheets download right away — it then runs in parallel
+   with the rest of the script and the CDN libraries instead of after them. */
+window.__KMS_FIRST_LOAD = (function () {
+  try {
+    var p = API.bootstrap();
+    p.catch(function () {});   // handled later in boot()
+    return p;
+  } catch (e) { return null; }
 })();
 
 /* ========== utils.js ========== */
@@ -2059,6 +2072,23 @@ window.APP = (function () {
 
   var charts = []; // live Chart.js instances (destroyed on re-render)
 
+  /* ---------------- offline cache (instant open) ----------------
+     The last successful download is kept in localStorage so the app can paint
+     immediately on the next visit while fresh data is fetched in the background. */
+  var CACHE_KEY = 'kms-cache-v1';
+  var syncing = false;
+  function cacheSave(data) {
+    try { localStorage.setItem(CACHE_KEY, JSON.stringify({ at: Date.now(), data: data })); } catch (e) {}
+  }
+  function cacheLoad() {
+    try {
+      var raw = localStorage.getItem(CACHE_KEY);
+      if (!raw) return null;
+      var c = JSON.parse(raw);
+      return (c && c.data && c.data.orders) ? c : null;
+    } catch (e) { return null; }
+  }
+
   var TITLES = {
     dashboard: 'Dashboard', orders: 'Tab 1 — Order Form', bom: 'Tab 2 — Kitting Master',
     fg: 'Tab 3 — FG Status', inventory: 'Tab 4 — Live Inventory', kitting: 'Tab 5 — Full Kitting Status',
@@ -2095,7 +2125,8 @@ window.APP = (function () {
   }
   function setSyncInfo() {
     var elx = document.getElementById('syncInfo');
-    elx.textContent = state.loadedAt ? ('Synced ' + state.loadedAt.toLocaleTimeString('en-IN')) : '—';
+    var base = state.loadedAt ? ('Synced ' + state.loadedAt.toLocaleTimeString('en-IN')) : '—';
+    elx.textContent = syncing ? (base + ' · updating…') : base;
   }
 
   /* ---------------- data loading ---------------- */
@@ -2104,6 +2135,7 @@ window.APP = (function () {
       if (!silent) busy(true);
       var fresh = await API.bootstrap();
       state.data = fresh;
+      cacheSave(fresh);
       state.loadedAt = new Date();
       setSyncInfo();
       updateCounts();
@@ -2517,19 +2549,41 @@ window.APP = (function () {
       state.searchHandlers.forEach(function (fn) { fn(); });
     }, 200));
 
-    // first load
-    try {
-      document.getElementById('loadingMsg').textContent = 'Loading data from Google Sheets…';
-      state.data = await API.bootstrap();
-      state.loadedAt = new Date();
-    } catch (err) {
-      showSetupScreen(err.message);
-      return;
+    // first load — show the cached copy instantly, then swap in fresh data
+    var cached = cacheLoad();
+    var firstLoad = window.__KMS_FIRST_LOAD || API.bootstrap();
+    if (cached) {
+      state.data = cached.data;
+      state.loadedAt = new Date(cached.at);
+      syncing = true;
+      document.getElementById('loading').classList.add('hidden');
+      setSyncInfo();
+      updateCounts();
+      navigate('dashboard');
+      firstLoad.then(function (fresh) {
+        state.data = fresh;
+        state.loadedAt = new Date();
+        cacheSave(fresh);
+        syncing = false;
+        setSyncInfo();
+        updateCounts();
+        if (!formInUse()) render();
+      }).catch(function () { syncing = false; setSyncInfo(); });
+    } else {
+      try {
+        document.getElementById('loadingMsg').textContent = 'Loading data from Google Sheets…';
+        state.data = await firstLoad;
+        state.loadedAt = new Date();
+        cacheSave(state.data);
+      } catch (err) {
+        showSetupScreen(err.message);
+        return;
+      }
+      document.getElementById('loading').classList.add('hidden');
+      setSyncInfo();
+      updateCounts();
+      navigate('dashboard');
     }
-    document.getElementById('loading').classList.add('hidden');
-    setSyncInfo();
-    updateCounts();
-    navigate('dashboard');
 
     // instant re-sync when the user returns to this browser tab
     document.addEventListener('visibilitychange', function () {
@@ -2538,6 +2592,7 @@ window.APP = (function () {
 
     // background auto-refresh (real-time sync with Google Sheets)
     setInterval(function () {
+      if (document.hidden) return;   // don't sync while the tab is in the background
       // never clobber a form in progress: typing, an open modal, a started BOM or a save in flight
       if (formInUse()) { pauseSyncNote(); return; }
       reload(true);
