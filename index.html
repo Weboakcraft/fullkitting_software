@@ -377,7 +377,10 @@ window.KMS_CONFIG = {
   CHAIR_CATEGORIES: ['KBC', 'HIGH BACK CHAIR', 'MEDIUM BACK CHAIR', 'MESH CHAIR W', 'MESH CHAIR G', 'BOOM BLACK', 'ROBO WHITE', 'POLO WHITE', '898 CHAIR', '805 CHAIR', '802 CHAIR', 'NAG NAGIN', 'MATRIX HIGH BACK BLACK', '15 NO CHAIR', 'SPINAL HB1', 'SPINAL HB2', 'SPINAL HB3', 'KBC CHAIR'],
   SUB_CATEGORIES: ['Chair', 'Sofa', 'Wardrobe (Almirah)', 'Recliner Chair', 'Recliner Sofa', 'Bed', 'Table', 'Other'],
   // Standard raw-material lines auto-loaded when Chair Category = Chair
-  CHAIR_PRESET_MATERIALS: ['Handle', 'Plate', 'Foam', 'Fabric', 'Base', 'Wheels', 'Hydraulic', 'Back Patta', 'Frame'],
+  CHAIR_PRESET_MATERIALS: ['Handle', 'Plate', 'Foam', 'Fabric', 'Base', 'Wheels', 'Hydraulic', 'Back Patta', 'Frame', 'Tower Bally', 'Ply', 'Hardware'],
+  // Raw materials whose "Type" dropdown is filled LIVE from the Inventory sheet
+  // (Inventory column C = category, column B = the value shown in the dropdown).
+  INVENTORY_TYPE_MATERIALS: ['Tower Bally', 'Ply', 'Fabric', 'Hardware'],
   // Kitting Master → "Type" dropdown lists. Live values come from the Masters
   // tab (one column per raw material name); this is only the offline fallback.
   BOM_TYPE_LISTS: {
@@ -956,6 +959,42 @@ window.VIEWS = (function () {
   function bomTypeOptions(key) { return M(key, (cfg.BOM_TYPE_LISTS || {})[key] || []); }
   function bomTypeCanAdd(key) { return (cfg.BOM_TYPE_ADD_OTHER || []).indexOf(key) !== -1; }
 
+  /* --- "Type" dropdowns built LIVE from the Inventory sheet ---------------
+     Rule: in the Inventory tab every row whose Category cell (column C)
+     matches the raw-material name puts its Material Name (column B) into that
+     row's Type dropdown. Matching ignores case and extra spaces, so upper,
+     lower or sentence case all work - only the spelling has to be correct. */
+  function invNorm(v) { return String(v == null ? '' : v).trim().toUpperCase().replace(/\s+/g, ' '); }
+  function invTypeOptions(name) {
+    var n = invNorm(name);
+    if (!n) return [];
+    var rows = D().inventory || [];
+    var seen = {}, out = [];
+    function push(v) {
+      var t = String(v == null ? '' : v).trim();
+      if (!t) return;
+      var k = invNorm(t);
+      if (seen[k]) return;
+      seen[k] = 1; out.push(t);
+    }
+    rows.forEach(function (r) { if (invNorm(r['Category']) === n) push(r['Material Name'] || r['Material Code']); });
+    if (!out.length) {
+      /* Category column still blank in the sheet? Then fall back to inventory
+         items whose own name contains that word - only for the materials
+         listed in INVENTORY_TYPE_MATERIALS, so other rows keep their lists. */
+      var allow = (cfg.INVENTORY_TYPE_MATERIALS || []).some(function (m) { return invNorm(m) === n; });
+      if (allow) {
+        var re = new RegExp('(^|\\s)' + n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '(\\s|$)');
+        rows.forEach(function (r) {
+          var nm = String(r['Material Name'] || r['Material Code'] || '').trim();
+          if (re.test(invNorm(nm))) push(nm);
+        });
+      }
+    }
+    out.sort(function (a, b) { return String(a).localeCompare(String(b)); });
+    return out;
+  }
+
   /** Make a table sortable by clicking headers. */
   function makeSortable(table) {
     var ths = table.querySelectorAll('th[data-sort]');
@@ -1236,19 +1275,24 @@ window.VIEWS = (function () {
       var cell = tr.querySelector('.ltcell');
       var old = tr.querySelector('.lt');
       var cur = (forceValue !== undefined && forceValue !== null) ? String(forceValue) : (old ? String(old.value || '') : '');
-      var key = bomTypeKey(tr.querySelector('.ln').value);
-      if (tr.__typeKey === key && forceValue === undefined) return;
-      tr.__typeKey = key;
-      if (!key) {
+      var rawName = String(tr.querySelector('.ln').value || '').trim();
+      var key = bomTypeKey(rawName);
+      var invList = invTypeOptions(rawName);
+      var sig = key + '#' + invNorm(rawName) + '#' + invList.length;
+      if (tr.__typeKey === sig && forceValue === undefined) return;
+      tr.__typeKey = sig;
+      if (!key && !invList.length) {
         cell.innerHTML = '<input class="lt" placeholder="Type" style="' + CELLCSS + '"/>';
         tr.querySelector('.lt').value = cur;
         return;
       }
-      var list = bomTypeOptions(key);
+      var list = invList.length ? invList : bomTypeOptions(key);
+      var label = key || rawName;
+      var canAdd = !invList.length && bomTypeCanAdd(key);
       var extra = (cur && list.indexOf(cur) === -1) ? '<option value="' + U.esc(cur) + '">' + U.esc(cur) + '</option>' : '';
       cell.innerHTML = '<select class="lt" style="' + CELLCSS + '">' +
-        '<option value="">— select ' + U.esc(key) + ' —</option>' + extra + options(list) +
-        (bomTypeCanAdd(key) ? '<option value="__ADD_OTHER__">＋ Add other…</option>' : '') +
+        '<option value="">— select ' + U.esc(label) + ' —</option>' + extra + options(list) +
+        (canAdd ? '<option value="__ADD_OTHER__">＋ Add other…</option>' : '') +
         '</select>';
       var sel = tr.querySelector('.lt');
       sel.value = cur;
