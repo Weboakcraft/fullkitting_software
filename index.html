@@ -1016,6 +1016,51 @@ window.VIEWS = (function () {
     return (cfg.BOM_MULTI_SELECT_MATERIALS || []).some(function (m) { return invNorm(m) === n; });
   }
 
+  /* ── One-time re-edit rule for Kitting Master (BOM) ─────────────
+     Once a product's BOM has been created it may be re-edited only ONE
+     time. After that single saved edit every edit button of that product
+     stays locked. The used-edit list is stored in the Settings sheet
+     (key BOM_EDIT_LOCKS) so the lock travels with the database, and it is
+     mirrored in localStorage for an instant / offline check. SKU matching
+     ignores case and extra spaces, exactly like the Type matching. */
+  var BOM_EDIT_LOCK_KEY = 'kms-bom-edit-locks-v1';
+  function bomLockId(sku) { return invNorm(sku); }
+  function bomLocksLocal() {
+    try { return JSON.parse(localStorage.getItem(BOM_EDIT_LOCK_KEY) || '{}') || {}; }
+    catch (e) { return {}; }
+  }
+  function bomLocksSheet() {
+    var raw = (D().settings || {}).BOM_EDIT_LOCKS;
+    if (!raw) return {};
+    try { return JSON.parse(raw) || {}; } catch (e) { return {}; }
+  }
+  function bomLocks() {
+    var m = bomLocksSheet(), l = bomLocksLocal();
+    Object.keys(l).forEach(function (k) { m[k] = Math.max(Number(m[k] || 0), Number(l[k] || 0)); });
+    return m;
+  }
+  function bomEditsUsed(sku) { return Number(bomLocks()[bomLockId(sku)] || 0); }
+  function bomEditLocked(sku) { return bomEditsUsed(sku) >= 1; }
+  function bomLockBadge(sku) {
+    return bomEditLocked(sku)
+      ? '<span class="small muted" title="This product BOM has already used its one allowed re-edit">🔒 Edit used</span> '
+      : '<span class="small muted" title="This product BOM can still be re-edited once">✏️ 1 edit left</span> ';
+  }
+  async function bomMarkEdited(sku) {
+    var id = bomLockId(sku);
+    if (!id) return;
+    var m = bomLocks();
+    m[id] = Number(m[id] || 0) + 1;
+    try { localStorage.setItem(BOM_EDIT_LOCK_KEY, JSON.stringify(m)); } catch (e) { }
+    try {
+      var cur = D().settings || {}, s = {};
+      Object.keys(cur).forEach(function (k) { s[k] = cur[k]; });
+      s.BOM_EDIT_LOCKS = JSON.stringify(m);
+      await API.saveSettings(s);
+      cur.BOM_EDIT_LOCKS = s.BOM_EDIT_LOCKS;
+    } catch (e) { }
+  }
+
   /** Make a table sortable by clicking headers. */
   function makeSortable(table) {
     var ths = table.querySelectorAll('th[data-sort]');
@@ -1578,7 +1623,7 @@ window.VIEWS = (function () {
             '<td>' + U.esc(g.cat) + '</td><td class="small">' + U.esc(g.sub) + '</td>' +
             '<td class="num">' + g.lines.length + '</td>' +
             '<td class="muted small">' + U.esc(ids) + '</td>' +
-            '<td class="rowactions"><button class="btn btn-sm" data-bomdetail="' + i + '">Details</button></td></tr>';
+            '<td class="rowactions">' + bomLockBadge(g.product) + '<button class="btn btn-sm" data-bomdetail="' + i + '">Details</button></td></tr>';
         }).join('') + '</tbody></table>';
       makeSortable(wrap.querySelector('table'));
       wrap.querySelectorAll('[data-bomdetail]').forEach(function (btn) {
@@ -1601,7 +1646,11 @@ window.VIEWS = (function () {
 
   /** All material lines of one Kitting Master product (opened by the Details button). */
   function bomDetailModal(g) {
+    var bLocked = bomEditLocked(g.product);
     openModal('Kitting Master — ' + (g.product || '—') + ' · ' + g.lines.length + ' materials',
+      (bLocked
+        ? '<p class="small muted">🔒 This product BOM has already used its one allowed re-edit, so editing is now locked.</p>'
+        : '<p class="small muted">✏️ This product BOM can be re-edited <b>one time only</b>. Once you save an edit, editing locks for this product.</p>') +
       '<div class="tablewrap"><table class="tbl"><thead><tr>' +
       '<th>BOM ID</th><th>Material Code</th><th>Material Name</th><th>Type</th><th class="num">Qty / Unit</th><th>Unit</th><th></th>' +
       '</tr></thead><tbody>' +
@@ -1611,7 +1660,7 @@ window.VIEWS = (function () {
           '<td class="small">' + U.esc(b['Type'] || '') + '</td>' +
           '<td class="num">' + U.fmtQty(b['Qty Per Unit']) + '</td><td>' + U.esc(b['Unit']) + '</td>' +
           '<td class="rowactions">' +
-          '  <button class="btn btn-sm" data-bedit="' + U.esc(b['BOM ID']) + '">✏️</button> ' +
+          '  <button class="btn btn-sm" data-bedit="' + U.esc(b['BOM ID']) + '"' + (bLocked ? ' disabled title="Re-edit already used — only one edit is allowed per product" style="opacity:.4;cursor:not-allowed"' : ' title="One-time re-edit"') + '>✏️</button> ' +
           '  <button class="btn btn-sm btn-danger" data-bdel="' + U.esc(b['BOM ID']) + '">🗑</button></td></tr>';
       }).join('') + '</tbody></table></div>',
       '<button class="btn" id="mCancel">Close</button>'
@@ -1633,6 +1682,11 @@ window.VIEWS = (function () {
   function editBomModal(bomId) {
     var b = D().bom.find(function (x) { return String(x['BOM ID']) === String(bomId); });
     if (!b) return;
+    /* One-time re-edit rule: a product BOM may be edited only once. */
+    if (bomEditLocked(b['Model No / SKU'])) {
+      U.toast('This product BOM has already been re-edited once — further editing is locked', 'bad');
+      return;
+    }
     openModal('Edit BOM Line — ' + bomId,
       '<form class="frm" id="editBomForm">' +
       '  <div class="field"><label>Chair Category</label><select name="Chair Category">' + options(mCat(), b['Chair Category']) + '</select></div>' +
@@ -1650,7 +1704,7 @@ window.VIEWS = (function () {
     document.getElementById('mSave').onclick = async function () {
       var fd = new FormData(document.getElementById('editBomForm')), p = { 'BOM ID': bomId };
       fd.forEach(function (v, k) { p[k] = v; });
-      try { APP.busy(true); await API.updateBomItem(p); U.toast('BOM updated', 'good'); closeModal(); await APP.reload(); }
+      try { APP.busy(true); await API.updateBomItem(p); await bomMarkEdited(b['Model No / SKU']); if (String(p['Model No / SKU'] || '') !== String(b['Model No / SKU'] || '')) await bomMarkEdited(p['Model No / SKU']); U.toast('BOM updated — the one-time re-edit for this product is now used', 'good'); closeModal(); await APP.reload(); }
       catch (err) { U.toast(err.message, 'bad'); } finally { APP.busy(false); }
     };
   }
