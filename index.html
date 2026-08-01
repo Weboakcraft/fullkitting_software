@@ -381,6 +381,9 @@ window.KMS_CONFIG = {
   // Raw materials whose "Type" box is a tick-box list (multiple items can be
   // selected). Values come from the same Inventory Category (col C) match.
   BOM_MULTI_SELECT_MATERIALS: ['Hardware'],
+  // Agar Inventory sheet ki Category spelling app ke raw material naam se alag
+  // ho to yahan jod dijiye - left = raw material name, right = Inventory Category.
+  MATERIAL_CATEGORY_ALIASES: { 'Tower Bally': 'Tower Belly' },
   // Kitting Master → "Type" dropdown lists. Live values come from the Masters
   // tab (one column per raw material name); this is only the offline fallback.
   BOM_TYPE_LISTS: {
@@ -959,11 +962,11 @@ window.VIEWS = (function () {
   function bomTypeOptions(key) { return M(key, (cfg.BOM_TYPE_LISTS || {})[key] || []); }
   function bomTypeCanAdd(key) { return (cfg.BOM_TYPE_ADD_OTHER || []).indexOf(key) !== -1; }
 
-  /* --- "Type" dropdowns built LIVE from the Inventory sheet ---------------
+  /* --- "Type" lists built LIVE from the Inventory sheet --------------------
      Rule: in the Inventory tab every row whose Category cell (column C)
      matches the raw-material name puts its Material Name (column B) into that
-     row's Type dropdown. Matching ignores case and extra spaces, so upper,
-     lower or sentence case all work - only the spelling has to be correct. */
+     row's Type list. Matching ignores case (UPPER / lower / Sentence all fine),
+     extra spaces, and singular vs plural (WHEEL = Wheels). */
   function invNorm(v) { return String(v == null ? '' : v).trim().toUpperCase().replace(/\s+/g, ' '); }
   function invTypeOptions(name) {
     var n = invNorm(name);
@@ -977,7 +980,24 @@ window.VIEWS = (function () {
       if (seen[k]) return;
       seen[k] = 1; out.push(t);
     }
-    rows.forEach(function (r) { if (invNorm(r['Category']) === n) push(r['Material Name'] || r['Material Code']); });
+    /* Naam ke alias bhi try karo (agar sheet me spelling thodi alag likhi ho). */
+    var cand = [n];
+    var al = cfg.MATERIAL_CATEGORY_ALIASES || {};
+    Object.keys(al).forEach(function (k) {
+      var a = invNorm(k), b = invNorm(al[k]);
+      if (a === n && cand.indexOf(b) === -1) cand.push(b);
+      if (b === n && cand.indexOf(a) === -1) cand.push(a);
+    });
+    /* 1) Category cell exactly match kare - case aur extra spaces ignore. */
+    rows.forEach(function (r) { if (cand.indexOf(invNorm(r['Category'])) !== -1) push(r['Material Name'] || r['Material Code']); });
+    /* 2) Singular/plural ka farq bhi ignore: "Wheels" <-> "WHEEL". */
+    if (!out.length) {
+      var sng = cand.map(function (c) { return c.replace(/S$/, ''); });
+      rows.forEach(function (r) {
+        var c = invNorm(r['Category']);
+        if (c && sng.indexOf(c.replace(/S$/, '')) !== -1) push(r['Material Name'] || r['Material Code']);
+      });
+    }
     if (!out.length) {
       /* Category column abhi blank hai? Tab tak fall back: inventory ke wo items
          jinke apne naam me yahi word aata hai, taaki list khali na rahe. */
