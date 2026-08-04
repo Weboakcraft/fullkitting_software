@@ -787,19 +787,61 @@ window.ENGINE = (function () {
     });
   }
 
+  /* ============================================================
+     STOCK ALLOCATION (reservation) - real kitting logic
+     Orders ek fixed sequence me check hote hain. Pehla order apna raw
+     material live stock se reserve kar leta hai; jo stock bachta hai wahi
+     agle order ko milta hai. Is liye ek hi material do orders ko ek saath
+     promise nahi hota, aur kisi bhi order ki shortage (jo PR me jati hai)
+     hamesha NET qty hoti hai jo abhi kharidni baaki hai.
+     ============================================================ */
+
+  /** Allocation sequence ke liye order ki date (Specification ID se). */
+  function orderDateMs(order) {
+    var s = String(order['Specification ID'] || '').trim(), m;
+    if ((m = /^(\d{4})-(\d{1,2})-(\d{1,2})/.exec(s))) return Date.UTC(+m[1], +m[2] - 1, +m[3]);
+    if ((m = /^(\d{1,2})\/(\d{1,2})\/(\d{4})/.exec(s))) return Date.UTC(+m[3], +m[2] - 1, +m[1]);
+    var dt = new Date(s);
+    return (s && !isNaN(dt.getTime())) ? dt.getTime() : NaN;
+  }
+
+  /** Active orders in allocation order: oldest first, then sheet row order. */
+  function allocationSequence(orders) {
+    return activeOrders(orders).slice().sort(function (a, b) {
+      var da = orderDateMs(a), db = orderDateMs(b);
+      var ha = !isNaN(da), hb = !isNaN(db);
+      if (ha && hb && da !== db) return da - db;
+      if (ha !== hb) return ha ? -1 : 1;   // jinki date hai wo pehle
+      return n(a._row) - n(b._row);        // same date -> sheet ka order
+    });
+  }
+
+  /** Stock bucket identity jisme se ye BOM line consume karti hai. */
+  function stockKey(inv, fallback) {
+    if (inv) return 'INV#' + invKey(inv['Material Code'] || inv['Material Name'] || '');
+    return 'MISS#' + invKey(fallback);   // material Inventory sheet me hi nahi hai
+  }
+
   /**
-   * Kitting evaluation of one order line against live stock.
+   * Ek order line ka kitting check, sirf us stock ke against jo abhi FREE hai.
+   * `pool` chalta hua stock ledger hai jo poore sequence me share hota hai:
+   * ye order jitna reserve karta hai wo pool se hat jata hai.
    * Returns { status: 'COMPLETE'|'PENDING'|'NO_BOM', lines, shortages, coverage }
    */
-  function evaluateOrder(order, bom, invMap) {
+  function evaluateOrderAllocated(order, bom, invMap, pool) {
     var reqs = orderRequirements(order, bom);
     if (!reqs.length) return { status: 'NO_BOM', lines: [], shortages: [], coverage: 0 };
 
     var okCount = 0;
     var lines = reqs.map(function (r) {
       var inv = invMap[invKey(r.materialType)] || invMap[invKey(r.materialName)] || invMap[invKey(r.materialCode)];
-      var avail = inv ? n(inv['Available Qty']) : 0;
-      var shortage = Math.max(0, r.requiredQty - avail);
+      var key = stockKey(inv, r.materialType || r.materialName || r.materialCode);
+      var total = inv ? n(inv['Available Qty']) : 0;
+      if (pool[key] === undefined) pool[key] = total;   // is material ko touch karne wala pehla order
+      var free = Math.max(0, n(pool[key]));             // pehle ke orders ke baad bacha stock
+      var reserved = Math.min(r.requiredQty, free);     // IS order ke liye reserve
+      pool[key] = free - reserved;                      // bacha hua agle order ke liye
+      var shortage = Math.max(0, r.requiredQty - reserved);
       var ok = shortage <= 0;
       if (ok) okCount++;
       return {
@@ -807,8 +849,13 @@ window.ENGINE = (function () {
         materialCode: r.materialCode, materialType: r.materialType || '',
         materialName: r.materialName || (inv ? inv['Material Name'] : ''),
         perUnit: r.perUnit, requiredQty: r.requiredQty,
-        availableQty: avail, shortageQty: shortage,
-        unit: r.unit || (inv ? inv['Unit'] : ''), ok: ok, inStockRecord: !!inv
+        totalStockQty: total,      // Inventory sheet me poora stock
+        freeBeforeQty: free,       // is order ki baari par free stock
+        availableQty: free,        // purane code / exports ke liye
+        reservedQty: reserved,     // is order ke liye lock
+        shortageQty: shortage,     // abhi kharidni hai
+        unit: r.unit || (inv ? inv['Unit'] : ''),
+        ok: ok, inStockRecord: !!inv, stockKey: key
       };
     });
 
@@ -821,36 +868,60 @@ window.ENGINE = (function () {
     };
   }
 
-  /** Evaluate every active order line. Returns [{order, result}] */
+  /** Ek order ka check poore stock ke against (bina reservation) - compatibility. */
+  function evaluateOrder(order, bom, invMap) {
+    return evaluateOrderAllocated(order, bom, invMap, {});
+  }
+
+  /**
+   * Har active order ko stock RESERVATION ke saath evaluate karo.
+   * Returns [{ order, result, seq }] allocation order me (seq 1 = pehle serve hua).
+   */
   function evaluateAll(orders, bom, inventory) {
     var invMap = inventoryMap(inventory);
-    return activeOrders(orders).map(function (o) {
-      return { order: o, result: evaluateOrder(o, bom, invMap) };
+    var pool = {};                               // chalta hua stock ledger
+    return allocationSequence(orders).map(function (o, i) {
+      var result = evaluateOrderAllocated(o, bom, invMap, pool);
+      result.seq = i + 1;
+      return { order: o, result: result, seq: i + 1 };
     });
   }
 
-  /** Aggregate shortages across evaluations, merged by material code. */
+  /** evaluateAll() ke result me se ek order line ka evaluation dhoondho. */
+  function evaluationFor(evaluations, row) {
+    for (var i = 0; i < (evaluations || []).length; i++) {
+      if (Number(evaluations[i].order._row) === Number(row)) return evaluations[i];
+    }
+    return null;
+  }
+
+  /**
+   * Di gayi evaluations ki shortages ko material ke hisaab se merge karo.
+   * Har shortage pehle se hi earlier orders ke reserved stock ko ghata kar (net)
+   * hai, is liye merged `shortageQty` bilkul wahi qty hai jo kharidni hai.
+   */
   function aggregateShortages(evaluations) {
-    var agg = {};
+    var agg = {}, out = [];
     evaluations.forEach(function (ev) {
       ev.result.shortages.forEach(function (s) {
-        var key = invKey(s.materialType || s.materialName || s.materialCode);
+        var key = s.stockKey || invKey(s.materialType || s.materialName || s.materialCode);
         if (!agg[key]) {
           agg[key] = {
             materialCode: s.materialCode, materialType: s.materialType || '',
             materialName: s.materialType || s.materialName, unit: s.unit,
-            requiredQty: 0, availableQty: s.availableQty, shortageQty: 0,
+            requiredQty: 0, availableQty: n(s.totalStockQty), reservedQty: 0, shortageQty: 0,
             orders: [], products: []
           };
+          out.push(agg[key]);
         }
         agg[key].requiredQty += s.requiredQty;
+        agg[key].reservedQty += n(s.reservedQty);
         agg[key].shortageQty += s.shortageQty;
         if (agg[key].orders.indexOf(s.orderId) === -1) agg[key].orders.push(s.orderId);
         if (agg[key].products.indexOf(s.productName) === -1) agg[key].products.push(s.productName);
       });
     });
-    return Object.keys(agg).map(function (k) { return agg[k]; })
-      .sort(function (a, b) { return b.shortageQty - a.shortageQty; });
+    return out.sort(function (a, b) { return b.shortageQty - a.shortageQty; });
   }
 
   /** Total raw-material consumption implied by orders (for reports). */
@@ -893,7 +964,12 @@ window.ENGINE = (function () {
     orderRequirements: orderRequirements,
     activeOrders: activeOrders,
     evaluateOrder: evaluateOrder,
+    evaluateOrderAllocated: evaluateOrderAllocated,
     evaluateAll: evaluateAll,
+    evaluationFor: evaluationFor,
+    allocationSequence: allocationSequence,
+    orderDateMs: orderDateMs,
+    stockKey: stockKey,
     aggregateShortages: aggregateShortages,
     consumption: consumption,
     bomProducts: bomProducts
@@ -1879,14 +1955,15 @@ window.VIEWS = (function () {
 
     root.appendChild(el(
       '<div class="grid cols-3">' +
-      stat('Full Kitting Completed', complete, 'var(--good)', 'orders ready to manufacture') +
-      stat('Full Kitting Pending', pending, 'var(--critical)', 'orders short of material') +
+      stat('Full Kitting Completed', complete, 'var(--good)', 'stock reserved · ready to manufacture') +
+      stat('Full Kitting Pending', pending, 'var(--critical)', 'reserved stock ke baad bhi short') +
       stat('No BOM Defined', noBom, 'var(--warning)', 'add these products in Kitting Master') +
       '</div>'
     ));
 
     var card = el(
-      '<div class="card"><h2>✅ Full Kitting Status <span class="sub">Requirement (FG Status) vs Live Inventory — updated in real time</span></h2>' +
+      '<div class="card"><h2>✅ Full Kitting Status <span class="sub">Requirement (FG Status) vs Live Inventory — stock order-by-order reserve hota hai</span></h2>' +
+    '<div class="notice">📌 <b>Stock reservation rule:</b> orders ko sequence me (Specification ID date, phir sheet order) check kiya jata hai. Pehle order ke liye raw material live stock se <b>reserve</b> ho jata hai aur sirf bacha hua stock agle order ko milta hai — is liye baad ke orders me shortage aa sakti hai. Har shortage already reserved stock ko ghata kar (<b>net</b>) dikhayi jati hai, is liye Purchase Requirement me wahi final qty aati hai jo aapko mangwani hai.</div>' +
       '<div class="filters">' +
       '  <div class="field"><label>Show</label><select id="kFilter">' +
       '    <option value="">All active orders</option><option value="PENDING">Pending only</option>' +
@@ -1908,26 +1985,32 @@ window.VIEWS = (function () {
       if (!rows.length) { wrap.innerHTML = '<div class="empty">Nothing to show.</div>'; return; }
       wrap.innerHTML =
         '<table class="tbl"><thead><tr>' +
-        '<th>Order ID</th><th>Specification ID</th><th>Chair Category</th><th>Model / SKU</th><th class="num">Qty</th>' +
-        '<th>Material Coverage</th><th>Kitting Status</th><th></th></tr></thead><tbody>' +
-        rows.map(function (ev) {
-          var o = ev.order, r = ev.result;
-          var statusHTML =
-            r.status === 'COMPLETE' ? '<span class="kit-complete">✔ Full Kitting Completed</span>' :
-            r.status === 'PENDING' ? '<span class="kit-pending">✖ Full Kitting Pending</span>' :
-            '<span class="muted">— No BOM defined</span>';
-          var meter = r.status === 'NO_BOM' ? '—' :
-            '<span class="meter' + (r.coverage === 100 ? ' full' : '') + '"><span style="width:' + r.coverage + '%"></span></span> <span class="small muted">' + r.coverage + '%</span>';
-          var actions = '<button class="btn btn-sm" data-detail="' + o._row + '">Details</button>';
-          if (r.status === 'PENDING') {
-            actions += ' <button class="btn btn-sm btn-order" data-shortage="' + U.esc(o['Order ID']) + '">🛒 Order Raw Material</button>';
-          }
-          return '<tr><td><b>' + U.esc(o['Order ID']) + '</b></td><td class="small">' + U.esc(o['Specification ID'] || '') + '</td>' +
-            '<td>' + U.esc(o['Chair Category'] || '') + '</td>' +
-            '<td>' + U.esc(ENGINE.orderLabel(o)) + '</td><td class="num">' + U.fmtQty(o['Ordered Qty']) + '</td>' +
-            '<td>' + meter + '</td><td>' + statusHTML + '</td>' +
-            '<td class="rowactions">' + actions + '</td></tr>';
-        }).join('') + '</tbody></table>';
+        '<th class="num" title="Stock reservation priority - chhota number pehle stock leta hai">#</th>' +
+      '<th>Order ID</th><th>Specification ID</th><th>Chair Category</th><th>Model / SKU</th><th class="num">Qty</th>' +
+        '<th>Material Coverage</th><th class="num">Short Materials</th><th>Kitting Status</th><th></th></tr></thead><tbody>' +
+      rows.map(function (ev) {
+        var o = ev.order, r = ev.result;
+        var statusHTML =
+          r.status === 'COMPLETE' ? '<span class="kit-complete">✔ Full Kitting Completed</span>' :
+          r.status === 'PENDING' ? '<span class="kit-pending">✖ Full Kitting Pending</span>' :
+          '<span class="muted">— No BOM defined</span>';
+        var meter = r.status === 'NO_BOM' ? '—' :
+          '<span class="meter' + (r.coverage === 100 ? ' full' : '') + '"><span style="width:' + r.coverage + '%"></span></span> <span class="small muted">' + r.coverage + '%</span>';
+        var shortCell = r.status === 'NO_BOM' ? '—'
+          : (r.shortages.length
+            ? '<b style="color:var(--critical)">' + r.shortages.length + '</b> <span class="small muted">/ ' + r.lines.length + '</span>'
+            : '<span class="small muted">0 / ' + r.lines.length + '</span>');
+        var actions = '<button class="btn btn-sm" data-detail="' + o._row + '">Details</button>';
+        if (r.status === 'PENDING') {
+          actions += ' <button class="btn btn-sm btn-order" data-shortage="' + U.esc(o['Order ID']) + '">🛒 Order Raw Material</button>';
+        }
+        return '<tr><td class="num muted small" title="Stock reservation priority">' + ev.seq + '</td>' +
+          '<td><b>' + U.esc(o['Order ID']) + '</b></td><td class="small">' + U.esc(o['Specification ID'] || '') + '</td>' +
+          '<td>' + U.esc(o['Chair Category'] || '') + '</td>' +
+          '<td>' + U.esc(ENGINE.orderLabel(o)) + '</td><td class="num">' + U.fmtQty(o['Ordered Qty']) + '</td>' +
+          '<td>' + meter + '</td><td class="num">' + shortCell + '</td><td>' + statusHTML + '</td>' +
+          '<td class="rowactions">' + actions + '</td></tr>';
+      }).join('') + '</tbody></table>';
 
       wrap.querySelectorAll('[data-detail]').forEach(function (b) { b.onclick = function () { kittingDetailModal(Number(b.dataset.detail)); }; });
       wrap.querySelectorAll('[data-shortage]').forEach(function (b) { b.onclick = function () { shortageModal([b.dataset.shortage]); }; });
@@ -1936,10 +2019,11 @@ window.VIEWS = (function () {
     card.querySelector('#kExcel').onclick = function () {
       U.exportExcel('Kitting_Status.xlsx', [{
         name: 'Kitting Status',
-        headers: ['Order ID', 'Specification ID', 'Chair Category', 'Model / SKU', 'Qty', 'Coverage %', 'Kitting Status'],
+        headers: ['Priority #', 'Order ID', 'Specification ID', 'Chair Category', 'Model / SKU', 'Qty', 'Coverage %', 'Short Materials', 'Kitting Status'],
         rows: evals.map(function (ev) {
-          return [ev.order['Order ID'], ev.order['Specification ID'], ev.order['Chair Category'], ENGINE.orderLabel(ev.order), ev.order['Ordered Qty'],
+          return [ev.seq, ev.order['Order ID'], ev.order['Specification ID'], ev.order['Chair Category'], ENGINE.orderLabel(ev.order), ev.order['Ordered Qty'],
             ev.result.coverage,
+            (ev.result.status === 'NO_BOM' ? '' : ev.result.shortages.length),
             ev.result.status === 'COMPLETE' ? 'Full Kitting Completed' : ev.result.status === 'PENDING' ? 'Full Kitting Pending' : 'No BOM'];
         })
       }]);
@@ -1965,20 +2049,31 @@ window.VIEWS = (function () {
 
   function kittingDetailModal(rowNum) {
     var d = D();
-    var o = d.orders.find(function (x) { return Number(x._row) === Number(rowNum); });
-    if (!o) return;
-    var r = ENGINE.evaluateOrder(o, d.bom, ENGINE.inventoryMap(d.inventory));
+    var evals = ENGINE.evaluateAll(d.orders, d.bom, d.inventory);
+    var ev = ENGINE.evaluationFor(evals, rowNum);
+    if (!ev) return;
+    var o = ev.order, r = ev.result;
+    var intro = '<div class="small muted" style="margin-bottom:10px">Stock reservation priority <b>#' + ev.seq + '</b>' +
+      (ev.seq > 1 ? ' — is order se pehle ' + (ev.seq - 1) + ' order apna raw material reserve kar chuke hain.'
+                  : ' — ye pehla order hai, ise poora live stock milta hai.') +
+      ' <b>Free Stock</b> = is order ki baari par bacha hua stock · <b>Reserved</b> = is order ke liye lock · <b>Shortage</b> = jo abhi kharidni hai.</div>';
     openModal('Kitting Detail — ' + o['Order ID'] + ' (' + ENGINE.orderLabel(o) + ' × ' + U.fmtQty(o['Ordered Qty']) + ')',
       (r.status === 'NO_BOM' ? '<div class="notice">No BOM defined for this product.</div>' :
+        intro +
         '<div class="tablewrap"><table class="tbl"><thead><tr>' +
-        '<th>Code</th><th>Material</th><th class="num">Required</th><th class="num">Available</th><th class="num">Shortage</th><th>Unit</th><th>Status</th>' +
+        '<th>Code</th><th>Material</th><th class="num">Required</th><th class="num">Total Stock</th>' +
+        '<th class="num">Free Stock</th><th class="num">Reserved</th><th class="num">Shortage</th><th>Unit</th><th>Status</th>' +
         '</tr></thead><tbody>' +
         r.lines.map(function (l) {
           return '<tr><td>' + U.esc(l.materialCode) + '</td><td>' + U.esc(l.materialType || l.materialName) + '</td>' +
-            '<td class="num">' + U.fmtQty(l.requiredQty) + '</td><td class="num">' + U.fmtQty(l.availableQty) + '</td>' +
+            '<td class="num">' + U.fmtQty(l.requiredQty) + '</td>' +
+            '<td class="num muted">' + U.fmtQty(l.totalStockQty) + '</td>' +
+            '<td class="num">' + U.fmtQty(l.freeBeforeQty) + '</td>' +
+            '<td class="num"><b>' + U.fmtQty(l.reservedQty) + '</b></td>' +
             '<td class="num">' + (l.shortageQty ? '<b style="color:var(--critical)">' + U.fmtQty(l.shortageQty) + '</b>' : '—') + '</td>' +
             '<td>' + U.esc(l.unit) + '</td>' +
-            '<td>' + (l.ok ? U.pill('Available', 'good') : U.pill(l.inStockRecord ? 'Insufficient' : 'Not in inventory', 'bad')) + '</td></tr>';
+            '<td>' + (l.ok ? U.pill('Reserved', 'good')
+                          : U.pill(l.inStockRecord ? (l.reservedQty > 0 ? 'Partly reserved' : 'Insufficient') : 'Not in inventory', 'bad')) + '</td></tr>';
         }).join('') + '</tbody></table></div>'),
       '<button class="btn" id="mCancel">Close</button>'
     );
@@ -1994,13 +2089,15 @@ window.VIEWS = (function () {
     if (!agg.length) { U.toast('No shortages found — kitting may already be complete.', 'good'); return; }
 
     openModal('Shortage Raw Materials — ' + orderIds.join(', '),
-      '<div class="small muted" style="margin-bottom:10px">Review the shortage list below, then click <b>Save as Purchase Requirement</b>. Quantities are merged across the selected orders.</div>' +
+      '<div class="small muted" style="margin-bottom:10px">Ye list <b>net shortage</b> hai — pehle wale orders ke liye jo stock reserve ho chuka hai wo already ghata diya gaya hai, aur selected orders ki qty merge kar di gayi hai. <b>Order Qty</b> column me jo number hai wahi aapko purchase karna hai. Neeche <b>Save as Purchase Requirement</b> dabaiye.</div>' +
       '<div class="tablewrap"><table class="tbl"><thead><tr>' +
-      '<th>Material Code</th><th>Raw Material Name</th><th class="num">Required</th><th class="num">Available</th><th class="num">Shortage</th><th>Unit</th><th>For Products</th>' +
+      '<th>Material Code</th><th>Raw Material Name</th><th class="num">Required</th><th class="num">Total Stock</th><th class="num">Reserved</th><th class="num">Order Qty (net short)</th><th>Unit</th><th>For Products</th>' +
       '</tr></thead><tbody>' +
       agg.map(function (s) {
         return '<tr><td>' + U.esc(s.materialCode) + '</td><td>' + U.esc(s.materialName) + '</td>' +
-          '<td class="num">' + U.fmtQty(s.requiredQty) + '</td><td class="num">' + U.fmtQty(s.availableQty) + '</td>' +
+          '<td class="num">' + U.fmtQty(s.requiredQty) + '</td>' +
+          '<td class="num muted">' + U.fmtQty(s.availableQty) + '</td>' +
+          '<td class="num">' + U.fmtQty(s.reservedQty) + '</td>' +
           '<td class="num"><b style="color:var(--critical)">' + U.fmtQty(s.shortageQty) + '</b></td>' +
           '<td>' + U.esc(s.unit) + '</td><td class="small">' + U.esc(s.products.join(', ')) + '</td></tr>';
       }).join('') + '</tbody></table></div>' +
@@ -2016,7 +2113,7 @@ window.VIEWS = (function () {
         ev.result.shortages.forEach(function (s) {
           items.push({
             'Material Code': s.materialCode, 'Material Name': s.materialName,
-            'Required Qty': s.requiredQty, 'Available Qty': s.availableQty, 'Shortage Qty': s.shortageQty,
+            'Required Qty': s.requiredQty, 'Available Qty': s.totalStockQty, 'Shortage Qty': s.shortageQty,
             'Unit': s.unit, 'Product Name': s.productName, 'Order ID': s.orderId
           });
         });
@@ -2667,7 +2764,7 @@ window.APP = (function () {
 
     /* ---- Shortage analysis ---- */
     root.insertAdjacentHTML('beforeend',
-      '<div class="card"><h2>🚨 Shortage Analysis <span class="sub">across all pending orders</span>' +
+      '<div class="card"><h2>🚨 Shortage Analysis <span class="sub">across all pending orders · net of stock already reserved for earlier orders</span>' +
       '<span style="float:right"><button class="btn btn-sm" id="expShort">⬇ Excel</button> <button class="btn btn-sm" id="pdfShort">⬇ PDF</button></span></h2>' +
       '<div class="tablewrap"><table class="tbl"><thead><tr><th>Code</th><th>Material</th><th class="num">Required</th><th class="num">Available</th><th class="num">Shortage</th><th>Unit</th><th>Affected Orders</th></tr></thead><tbody>' +
       (shortages.length ? shortages.map(function (s) {
