@@ -616,8 +616,8 @@ window.U = (function () {
     return { doc: doc, startY: y + 8 };
   }
 
-  function pdfTable(doc, startY, headers, rows) {
-    doc.autoTable({
+  function pdfTable(doc, startY, headers, rows, opts) {
+    var conf = {
       startY: startY,
       head: [headers],
       body: rows,
@@ -625,7 +625,9 @@ window.U = (function () {
       headStyles: { fillColor: [16, 66, 129], textColor: [255, 255, 255], fontStyle: 'bold' },
       alternateRowStyles: { fillColor: [246, 248, 251] },
       margin: { left: 40, right: 40 }
-    });
+    };
+    if (opts) Object.keys(opts).forEach(function (k) { conf[k] = opts[k]; });
+    doc.autoTable(conf);
     return doc.lastAutoTable.finalY;
   }
 
@@ -649,6 +651,7 @@ window.U = (function () {
       '<html><head><title>' + esc(title) + '</title><style>' +
       'body{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;color:#0b0b0b;margin:32px;}' +
       'h1{font-size:20px;margin:0 0 4px;} .sub{color:#52514e;font-size:12px;margin-bottom:16px;}' +
+      'h2{font-size:14px;margin:20px 0 4px;} table{margin-bottom:8px;}' +
       'table{border-collapse:collapse;width:100%;font-size:12px;}' +
       'th{background:#104281;color:#fff;text-align:left;padding:6px 8px;}' +
       'td{border-bottom:1px solid #e1e0d9;padding:6px 8px;}' +
@@ -2157,26 +2160,93 @@ window.VIEWS = (function () {
     return { pr: pr, items: items };
   }
 
+  /**
+   * Merge saved PR item rows (one row per order per material) into ONE row per
+   * raw material. Summing 'Shortage Qty' is safe because every row's shortage is
+   * already NET of the stock reserved for earlier orders -> the sum is exactly
+   * the qty that has to be purchased.
+   */
+  function prMergeItems(items) {
+    var map = {}, out = [];
+    (items || []).forEach(function (it) {
+      var code = String(it['Material Code'] == null ? '' : it['Material Code']).trim();
+      var name = String(it['Material Name'] == null ? '' : it['Material Name']).trim();
+      var unit = String(it['Unit'] == null ? '' : it['Unit']).trim();
+      var key = ((code || name) + '|' + unit).toLowerCase();
+      var row = map[key];
+      if (!row) {
+        row = map[key] = {
+          materialCode: code, materialName: name, unit: unit,
+          requiredQty: 0, orderQty: 0, orders: [], products: []
+        };
+        out.push(row);
+      }
+      if (!row.materialCode && code) row.materialCode = code;
+      if (!row.materialName && name) row.materialName = name;
+      row.requiredQty += U.num(it['Required Qty']);
+      row.orderQty += U.num(it['Shortage Qty']);
+      var oid = String(it['Order ID'] == null ? '' : it['Order ID']).trim();
+      if (oid && row.orders.indexOf(oid) === -1) row.orders.push(oid);
+      var pn = String(it['Product Name'] == null ? '' : it['Product Name']).trim();
+      if (pn && row.products.indexOf(pn) === -1) row.products.push(pn);
+    });
+    var positive = out.filter(function (r) { return r.orderQty > 0; });
+    var list = positive.length ? positive : out;
+    return list.sort(function (a, b) {
+      return String(a.materialName || '').localeCompare(String(b.materialName || ''));
+    });
+  }
+
   function prPdf(prNumber) {
     var rec = prRecord(prNumber);
     if (!rec.pr) return U.toast('PR not found', 'bad');
     var s = D().settings || {};
+    var merged = prMergeItems(rec.items);
     var p = U.pdfDoc('PURCHASE REQUIREMENT — ' + prNumber, [
       'PR Date: ' + U.fmtDate(rec.pr['PR Date']) + '        Status: ' + rec.pr['Status'],
-      'Against Orders: ' + (rec.pr['Related Order IDs'] || '—'),
-      'Prepared By: ' + (rec.pr['Created By'] || '—') + (rec.pr['Remarks'] ? '        Remarks: ' + rec.pr['Remarks'] : ''),
-      (s.COMPANY_ADDRESS ? String(s.COMPANY_ADDRESS) : '')
+      'Against Orders: ' + (rec.pr['Related Order IDs'] || '-'),
+      'Prepared By: ' + (rec.pr['Created By'] || '-') + (rec.pr['Remarks'] ? '        Remarks: ' + rec.pr['Remarks'] : ''),
+      (s.COMPANY_ADDRESS ? String(s.COMPANY_ADDRESS) : ''),
+      'Materials to purchase: ' + merged.length + '   |   ORDER QTY = net qty to buy (stock already reserved for earlier orders is deducted).'
     ].filter(Boolean));
-    var y = U.pdfTable(p.doc, p.startY,
-      ['#', 'Material Code', 'Raw Material Name', 'Required', 'Available', 'Shortage (Order Qty)', 'Unit', 'For Product', 'Order ID'],
-      rec.items.map(function (it, i) {
-        return [i + 1, it['Material Code'], it['Material Name'], U.fmtQty(it['Required Qty']),
-          U.fmtQty(it['Available Qty']), U.fmtQty(it['Shortage Qty']), it['Unit'], it['Product Name'], it['Order ID']];
-      }));
-    // signature block
     var doc = p.doc;
     var H = doc.internal.pageSize.getHeight();
+
+    /* ---- A. what actually has to be purchased: one row per raw material ---- */
+    doc.setFont('helvetica', 'bold'); doc.setFontSize(11); doc.setTextColor(11, 11, 11);
+    doc.text('A. MATERIALS TO PURCHASE', 40, p.startY + 6);
+    var y = U.pdfTable(doc, p.startY + 16,
+      ['#', 'Material Code', 'Raw Material Name', 'Unit', 'Total Required', 'ORDER QTY', 'For Orders'],
+      merged.map(function (r, i) {
+        return [i + 1, r.materialCode || '-', r.materialName, r.unit || '-',
+          U.fmtQty(r.requiredQty), U.fmtQty(r.orderQty), r.orders.join(', ') || '-'];
+      }),
+      {
+        columnStyles: {
+          0: { cellWidth: 22, halign: 'right' },
+          4: { halign: 'right' },
+          5: { halign: 'right', fontStyle: 'bold', fontSize: 10, textColor: [176, 42, 55] },
+          6: { fontSize: 7 }
+        }
+      });
+
+    /* ---- B. order-wise break-up, for reference only ---- */
+    if (rec.items.length > merged.length) {
+      if (y > H - 170) { doc.addPage(); y = 50; }
+      doc.setFont('helvetica', 'bold'); doc.setFontSize(11); doc.setTextColor(11, 11, 11);
+      doc.text('B. ORDER-WISE BREAK-UP (reference)', 40, y + 30);
+      y = U.pdfTable(doc, y + 40,
+        ['#', 'Material Code', 'Raw Material Name', 'Required', 'Total Stock', 'Short Qty', 'Unit', 'For Product', 'Order ID'],
+        rec.items.map(function (it, i) {
+          return [i + 1, it['Material Code'], it['Material Name'], U.fmtQty(it['Required Qty']),
+            U.fmtQty(it['Available Qty']), U.fmtQty(it['Shortage Qty']), it['Unit'], it['Product Name'], it['Order ID']];
+        }),
+        { styles: { font: 'helvetica', fontSize: 7.5, cellPadding: 4, textColor: [11, 11, 11] } });
+    }
+
+    // signature block
     if (y > H - 120) { doc.addPage(); y = 60; }
+    doc.setFont('helvetica', 'normal');
     doc.setFontSize(9); doc.setTextColor(82, 81, 78);
     doc.text('Prepared By', 60, y + 60); doc.line(50, y + 46, 170, y + 46);
     doc.text('Approved By', 250, y + 60); doc.line(240, y + 46, 360, y + 46);
@@ -2188,11 +2258,21 @@ window.VIEWS = (function () {
   function prPrint(prNumber) {
     var rec = prRecord(prNumber);
     if (!rec.pr) return U.toast('PR not found', 'bad');
+    var merged = prMergeItems(rec.items);
     U.printHTML('Purchase Requirement ' + prNumber,
       '<h1>' + U.esc(cfg.COMPANY_NAME) + ' — Purchase Requirement ' + U.esc(prNumber) + '</h1>' +
-      '<div class="sub">Date: ' + U.fmtDate(rec.pr['PR Date']) + ' · Against orders: ' + U.esc(rec.pr['Related Order IDs'] || '—') +
-      ' · Prepared by: ' + U.esc(rec.pr['Created By'] || '—') + '</div>' +
-      '<table><thead><tr><th>#</th><th>Code</th><th>Material</th><th>Required</th><th>Available</th><th>Shortage</th><th>Unit</th><th>Product</th><th>Order</th></tr></thead><tbody>' +
+      '<div class="sub">Date: ' + U.fmtDate(rec.pr['PR Date']) + ' · Against orders: ' + U.esc(rec.pr['Related Order IDs'] || '-') +
+      ' · Prepared by: ' + U.esc(rec.pr['Created By'] || '-') + '</div>' +
+      '<h2>A. Materials to purchase (' + merged.length + ')</h2>' +
+      '<div class="sub">Order Qty = net qty to buy. Stock already reserved for earlier orders is deducted.</div>' +
+      '<table><thead><tr><th>#</th><th>Code</th><th>Raw Material</th><th>Unit</th><th>Total Required</th><th>Order Qty</th><th>For Orders</th></tr></thead><tbody>' +
+      merged.map(function (r, i) {
+        return '<tr><td>' + (i + 1) + '</td><td>' + U.esc(r.materialCode) + '</td><td>' + U.esc(r.materialName) + '</td>' +
+          '<td>' + U.esc(r.unit) + '</td><td>' + U.fmtQty(r.requiredQty) + '</td>' +
+          '<td><b>' + U.fmtQty(r.orderQty) + '</b></td><td>' + U.esc(r.orders.join(', ')) + '</td></tr>';
+      }).join('') + '</tbody></table>' +
+      '<h2>B. Order-wise break-up</h2>' +
+      '<table><thead><tr><th>#</th><th>Code</th><th>Material</th><th>Required</th><th>Total Stock</th><th>Short Qty</th><th>Unit</th><th>Product</th><th>Order</th></tr></thead><tbody>' +
       rec.items.map(function (it, i) {
         return '<tr><td>' + (i + 1) + '</td><td>' + U.esc(it['Material Code']) + '</td><td>' + U.esc(it['Material Name']) + '</td>' +
           '<td>' + U.fmtQty(it['Required Qty']) + '</td><td>' + U.fmtQty(it['Available Qty']) + '</td>' +
@@ -2258,18 +2338,30 @@ window.VIEWS = (function () {
   function prViewModal(prNumber) {
     var rec = prRecord(prNumber);
     if (!rec.pr) return;
+    var merged = prMergeItems(rec.items);
     openModal('Purchase Requirement — ' + prNumber,
       '<div class="small muted" style="margin-bottom:10px">Date: ' + U.fmtDate(rec.pr['PR Date']) +
-      ' · Status: ' + U.esc(rec.pr['Status']) + ' · Orders: ' + U.esc(rec.pr['Related Order IDs'] || '—') + '</div>' +
+      ' · Status: ' + U.esc(rec.pr['Status']) + ' · Orders: ' + U.esc(rec.pr['Related Order IDs'] || '-') + '</div>' +
+      '<div class="notice">🛒 <b>Order karne ki actual qty</b> — neeche har raw material ki ek hi merged line hai aur <b>Order Qty</b> wahi net qty hai jo purchase karni hai (pehle wale orders ke liye reserved stock already minus). Yahi table PDF aur Print me bhi aata hai.</div>' +
       '<div class="tablewrap"><table class="tbl"><thead><tr>' +
-      '<th>#</th><th>Code</th><th>Material</th><th class="num">Required</th><th class="num">Available</th><th class="num">Shortage</th><th>Unit</th><th>Product</th><th>Order</th>' +
+      '<th>#</th><th>Code</th><th>Raw Material</th><th>Unit</th><th class="num">Total Required</th><th class="num">Order Qty</th><th>For Orders</th>' +
+      '</tr></thead><tbody>' +
+      merged.map(function (r, i) {
+        return '<tr><td>' + (i + 1) + '</td><td>' + U.esc(r.materialCode) + '</td><td>' + U.esc(r.materialName) + '</td>' +
+          '<td>' + U.esc(r.unit) + '</td><td class="num muted">' + U.fmtQty(r.requiredQty) + '</td>' +
+          '<td class="num"><b style="color:var(--critical)">' + U.fmtQty(r.orderQty) + '</b></td>' +
+          '<td class="small">' + U.esc(r.orders.join(', ')) + '</td></tr>';
+      }).join('') + '</tbody></table></div>' +
+      '<details style="margin-top:12px"><summary class="small muted" style="cursor:pointer">Order-wise break-up dekhein (' + rec.items.length + ' rows)</summary>' +
+      '<div class="tablewrap" style="margin-top:8px"><table class="tbl"><thead><tr>' +
+      '<th>#</th><th>Code</th><th>Material</th><th class="num">Required</th><th class="num">Total Stock</th><th class="num">Short</th><th>Unit</th><th>Product</th><th>Order</th>' +
       '</tr></thead><tbody>' +
       rec.items.map(function (it, i) {
         return '<tr><td>' + (i + 1) + '</td><td>' + U.esc(it['Material Code']) + '</td><td>' + U.esc(it['Material Name']) + '</td>' +
           '<td class="num">' + U.fmtQty(it['Required Qty']) + '</td><td class="num">' + U.fmtQty(it['Available Qty']) + '</td>' +
           '<td class="num"><b>' + U.fmtQty(it['Shortage Qty']) + '</b></td><td>' + U.esc(it['Unit']) + '</td>' +
           '<td>' + U.esc(it['Product Name']) + '</td><td>' + U.esc(it['Order ID']) + '</td></tr>';
-      }).join('') + '</tbody></table></div>',
+      }).join('') + '</tbody></table></div></details>',
       '<button class="btn" id="mCancel">Close</button>' +
       '<button class="btn" id="mPrint">🖨 Print</button>' +
       '<button class="btn btn-primary" id="mPdf">⬇ Download PDF</button>'
