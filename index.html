@@ -462,9 +462,72 @@ window.API = (function () {
     return json.data;
   }
 
+  /* ---------- sheet header normalisation ----------
+     Sheet headers are matched ignoring case and extra spaces, so 'ORDER ID',
+     'Order Id' and 'order  id' all work. Columns are read by HEADER NAME, never
+     by position, so moving a column (e.g. Timestamp to A, Order ID to B) is safe. */
+  function hkey(k) { return String(k == null ? '' : k).toLowerCase().replace(/\s+/g, ' ').trim(); }
+  function lowMap(rec) { var low = {}; Object.keys(rec).forEach(function (key) { low[hkey(key)] = rec[key]; }); return low; }
+  function blank(v) { return v === undefined || v === null || String(v).trim() === ''; }
+
+  /* Canonical fields of the non-order sheets (Kitting Master, Inventory, PR ...). */
+  var GENERIC_FIELDS = ['Order ID', 'PR Number', 'Material Code', 'Material Name', 'Category', 'Available Qty', 'Unit', 'Min Stock Level', 'Location', 'Last Updated', 'BOM ID', 'Chair Category', 'Sub Category', 'Model No / SKU', 'Raw Material Code', 'Raw Material Name', 'Type', 'Qty Per Unit', 'Remarks', 'Created At', 'Order Status'];
+
+  /* ORDERS sheet - new structure (Sep 2026).
+     Canonical field -> header names accepted (first = current header; the rest are
+     the OLD headers, still read so older rows / an old sheet keep working).
+       A Timestamp        (was Specification ID)
+       B Order ID         (was column A)
+       Order Type         (was Chair Type)
+       Product Category   (was Chair Category)
+       Product Image      (Item Pic + Item Pic URL merged - holds the image link)
+       Product Name       (SKU + Model No merged)
+       Product Qty        (was Ordered Qty)
+       Order Status
+     Fabric File & Code and Handle Type have been removed. */
+  var ORDER_FIELDS = {
+    'Timestamp':        ['timestamp', 'specification id'],
+    'Order ID':         ['order id'],
+    'Order Type':       ['order type', 'chair type'],
+    'Product Category': ['product category', 'chair category'],
+    'Product Image':    ['product image', 'item pic url', 'item pic'],
+    'Product Name':     ['product name', 'sku', 'model no'],
+    'Product Qty':      ['product qty', 'ordered qty', 'ordred qty'],
+    'Order Status':     ['order status', 'status']
+  };
+  function normalizeOrder(rec) {
+    var low = lowMap(rec);
+    Object.keys(ORDER_FIELDS).forEach(function (f) {
+      if (!blank(rec[f])) return;
+      var names = ORDER_FIELDS[f];
+      for (var i = 0; i < names.length; i++) {
+        if (!blank(low[names[i]])) { rec[f] = low[names[i]]; return; }
+      }
+      if (rec[f] === undefined) rec[f] = '';
+    });
+    return rec;
+  }
+  function normalizeData(data) {
+    if (!data) return data;
+    Object.keys(data).forEach(function (k) {
+      var arr = data[k];
+      if (!Array.isArray(arr)) return;
+      var isOrders = hkey(k) === 'orders';
+      arr.forEach(function (rec) {
+        if (!rec || typeof rec !== 'object') return;
+        if (isOrders) { normalizeOrder(rec); return; }
+        var low = lowMap(rec);
+        GENERIC_FIELDS.forEach(function (w) {
+          if (blank(rec[w]) && low[hkey(w)] !== undefined) rec[w] = low[hkey(w)];
+        });
+      });
+    });
+    return data;
+  }
+
   return {
     ping: function () { return get('ping'); },
-    bootstrap: function () { return get('bootstrap').then(function (data) { if (data) { Object.keys(data).forEach(function (k) { var arr = data[k]; if (Array.isArray(arr)) { arr.forEach(function (rec) { if (rec && typeof rec === 'object') { var low = {}; Object.keys(rec).forEach(function (key) { low[String(key).toLowerCase().replace(/\s+/g, ' ').trim()] = rec[key]; }); var want = ['Order ID','Specification ID','Chair Type','Chair Category','Item Pic','SKU','Model No','Fabric File & Code','Handle Type','Ordered Qty','Order Status','Material Code','Material Name','Category','Available Qty','Unit','Min Stock Level','Location','Last Updated','BOM ID','Sub Category','Model No / SKU','Raw Material Code','Raw Material Name','Qty Per Unit','Remarks','Created At']; want.forEach(function (w) { var lk = w.toLowerCase(); var alt = lk.replace('ordered','ordred'); if (rec[w] === undefined || rec[w] === '') { if (low[lk] !== undefined) rec[w] = low[lk]; else if (low[alt] !== undefined) rec[w] = low[alt]; } }); } }); } }); } return data; }); },
+    bootstrap: function () { return get('bootstrap').then(normalizeData); },
     // orders
     createOrder: function (o) { return post('createOrder', o); },
     updateOrder: function (o) { return post('updateOrder', o); },
@@ -679,7 +742,8 @@ window.U = (function () {
    - Shortage lists               (for Purchase Requirements)
    Matching rule: an order line is matched to the Kitting Master
    ('Model No / SKU' column) by trying, in this priority:
-     1. order SKU   2. order Model No   3. order Chair Category
+     1. order Product Name (SKU / Model No)   2. order Product Category
+   and finally Product Category -> Kitting Master 'Sub Category'.
    ============================================================ */
 window.ENGINE = (function () {
 
@@ -695,18 +759,18 @@ window.ENGINE = (function () {
     return String(v == null ? '' : v).trim().toUpperCase().replace(/\s+/g, ' ');
   }
 
-  /** The key used to find this order line's BOM. */
+  /** The keys used to find this order line's BOM (Product Name holds SKU / Model No). */
   function orderKeys(order) {
-    return [order['SKU'], order['Model No'], order['Chair Category']]
+    return [order['Product Name'], order['Product Category']]
       .map(norm).filter(function (k) { return k !== ''; });
   }
 
   /** Human label for the ordered product (for tables, PDFs, reports). */
   function orderLabel(order) {
-    return String(order['Model No'] || order['SKU'] || order['Chair Category'] || '').trim() || '—';
+    return String(order['Product Name'] || order['Product Category'] || '').trim() || '—';
   }
 
-  function orderQty(order) { return n(order['Ordered Qty']); }
+  function orderQty(order) { return n(order['Product Qty']); }
 
   /** Map of Material Code AND Material Name -> inventory row (case/space-insensitive). */
   function inventoryMap(inventory) {
@@ -730,7 +794,7 @@ window.ENGINE = (function () {
 
   /**
    * BOM lines matched by category:
-   *   Order Form 'Chair Category'  ->  Kitting Master 'Sub Category'.
+   *   Order Form 'Product Category'  ->  Kitting Master 'Sub Category'.
    * Fill the Kitting Master once for a Sub Category and every order of that
    * category picks the same BOM up automatically (FG Status / Full Kitting / PR).
    */
@@ -750,7 +814,7 @@ window.ENGINE = (function () {
     return groups[seen[seen.length - 1]];
   }
 
-  /** BOM lines for an order line: first key (SKU → Model No → Chair Category) that has a BOM wins. */
+  /** BOM lines for an order line: first key (Product Name → Product Category) that has a BOM wins. */
   function bomForOrder(bom, order) {
     var keys = orderKeys(order);
     for (var i = 0; i < keys.length; i++) {
@@ -758,7 +822,7 @@ window.ENGINE = (function () {
       if (lines.length) return lines;
     }
     // nothing matched by SKU / Model No -> fall back to the category BOM
-    return bomForSubCategory(bom, order['Chair Category']);
+    return bomForSubCategory(bom, order['Product Category']);
   }
 
   /**
@@ -799,16 +863,22 @@ window.ENGINE = (function () {
      hamesha NET qty hoti hai jo abhi kharidni baaki hai.
      ============================================================ */
 
-  /** Allocation sequence ke liye order ki date (Specification ID se). */
+  /** Allocation sequence ke liye order ka Timestamp (date + time) milliseconds me.
+      Supports 'YYYY-MM-DD HH:MM:SS' (app), 'DD/MM/YYYY HH:MM:SS' (sheet / form)
+      and ISO dates that Google Sheets sends for real date cells. */
   function orderDateMs(order) {
-    var s = String(order['Specification ID'] || '').trim(), m;
-    if ((m = /^(\d{4})-(\d{1,2})-(\d{1,2})/.exec(s))) return Date.UTC(+m[1], +m[2] - 1, +m[3]);
-    if ((m = /^(\d{1,2})\/(\d{1,2})\/(\d{4})/.exec(s))) return Date.UTC(+m[3], +m[2] - 1, +m[1]);
+    var s = String(order['Timestamp'] || '').trim(), m;
+    if (!s) return NaN;
+    if (/^\d{4}-\d{2}-\d{2}T/.test(s)) { var iso = Date.parse(s); if (!isNaN(iso)) return iso; }
+    if ((m = /^(\d{4})-(\d{1,2})-(\d{1,2})(?:[ T]+(\d{1,2}):(\d{2})(?::(\d{2}))?)?/.exec(s)))
+      return new Date(+m[1], +m[2] - 1, +m[3], +(m[4] || 0), +(m[5] || 0), +(m[6] || 0)).getTime();
+    if ((m = /^(\d{1,2})\/(\d{1,2})\/(\d{4})(?:[ ,]+(\d{1,2}):(\d{2})(?::(\d{2}))?)?/.exec(s)))
+      return new Date(+m[3], +m[2] - 1, +m[1], +(m[4] || 0), +(m[5] || 0), +(m[6] || 0)).getTime();
     var dt = new Date(s);
-    return (s && !isNaN(dt.getTime())) ? dt.getTime() : NaN;
+    return !isNaN(dt.getTime()) ? dt.getTime() : NaN;
   }
 
-  /** Active orders in allocation order: oldest first, then sheet row order. */
+  /** Active orders in allocation order: oldest Timestamp first, then sheet row order. */
   function allocationSequence(orders) {
     return activeOrders(orders).slice().sort(function (a, b) {
       var da = orderDateMs(a), db = orderDateMs(b);
@@ -1016,11 +1086,15 @@ window.VIEWS = (function () {
     var m = (D().masters || {})[name];
     return (m && m.length) ? m : (fallback || []);
   }
-  function mCat() { return M('Chair Category', cfg.CHAIR_CATEGORIES); }
+  /* First Masters column (by any of the given names) that has values, else fallback. */
+  function MAny(names, fallback) {
+    for (var i = 0; i < names.length; i++) { var m = M(names[i], null); if (m && m.length) return m; }
+    return fallback || [];
+  }
+  /* Product Category list (order form) = Sub Category list of the Kitting Master. */
+  function mCat() { return MAny(['Product Category', 'Chair Category'], cfg.CHAIR_CATEGORIES); }
   function mSub() { return M('Sub Category', cfg.SUB_CATEGORIES); }
-  function mType() { return M('Chair Type', cfg.CHAIR_TYPES); }
-  function mHandle() { return M('Handle Type', cfg.HANDLE_TYPES); }
-  function mFabric() { return M('Fabric File & Code', cfg.FABRICS); }
+  function mType() { return MAny(['Order Type', 'Chair Type'], cfg.CHAIR_TYPES); }
 
   /* --- Kitting Master "Type" dropdowns (lists live in the Masters tab) --- */
   function bomTypeKey(name) {
@@ -1189,26 +1263,26 @@ window.VIEWS = (function () {
   /* ============================================================
      TAB 1 — ORDER FORM
      ============================================================ */
+  /* Orders sheet columns (new structure). Fabric File & Code and Handle Type are
+     no longer on the order - fabric / handle come from the Kitting Master BOM. */
+  var ORDER_COLS = ['Timestamp', 'Order ID', 'Order Type', 'Product Category', 'Product Image', 'Product Name', 'Product Qty', 'Order Status'];
+
   function renderOrders(root) {
     var d = D();
     var products = ENGINE.bomProducts(d.bom);
 
     root.appendChild(el(
       '<div class="card">' +
-      '<h2>➕ Create New Order <span class="sub">Order ID blank = auto (ORD0552 style) · Specification ID auto = Save Order click ka timestamp · same Order ID with multiple items allowed</span></h2>' +
+      '<h2>➕ Create New Order <span class="sub">Order ID blank = auto (ORD0552 style) · Timestamp auto = Save Order click ka time · same Order ID with multiple items allowed</span></h2>' +
       '<form class="frm" id="orderForm">' +
+      '  <div class="field"><label>TIMESTAMP (auto)</label><input name="Timestamp" id="specStamp" readonly tabindex="-1" title="Save Order dabate hi timestamp apne aap capture ho jayega" style="background:var(--page);color:var(--ink-2);cursor:not-allowed" /></div>' +
       '  <div class="field"><label>ORDER ID (blank = auto)</label><input name="Order ID" placeholder="auto e.g. ORD0552" /></div>' +
-      '  <div class="field"><label>SPECIFICATION ID (auto)</label><input name="Specification ID" id="specStamp" readonly tabindex="-1" title="Save Order dabate hi timestamp apne aap capture ho jayega" style="background:var(--page);color:var(--ink-2);cursor:not-allowed" /></div>' +
-      '  <div class="field"><label>CHAIR TYPE *</label><select name="Chair Type" required><option value="">— select —</option>' + options(mType()) + '</select></div>' +
-      '  <div class="field"><label>CHAIR CATEGORY *</label><select name="Chair Category" required><option value="">— select —</option>' + options(mCat()) + '</select></div>' +
-      '  <div class="field"><label>ITEM PIC</label><input name="Item Pic" placeholder="SPECIFICATION_IMAGES\\474.ITEM PIC.JPG" /></div>' +
-      '  <div class="field"><label>SKU</label><input name="SKU" list="productList" placeholder="e.g. BOOMBLACK-1" />' +
+      '  <div class="field"><label>ORDER TYPE *</label><select name="Order Type" required><option value="">— select —</option>' + options(mType()) + '</select></div>' +
+      '  <div class="field"><label>PRODUCT CATEGORY *</label><select name="Product Category" required><option value="">— select —</option>' + options(mCat()) + '</select></div>' +
+      '  <div class="field"><label>PRODUCT NAME (SKU / Model No)</label><input name="Product Name" list="productList" placeholder="e.g. BOOMBLACK-1 / HIGH BACK CHAIR" />' +
       '    <datalist id="productList">' + products.map(function (p) { return '<option value="' + U.esc(p.product) + '">'; }).join('') + '</datalist></div>' +
-      '  <div class="field"><label>MODEL NO</label><input name="Model No" list="productList" placeholder="e.g. HIGH BACK CHAIR" /></div>' +
-      '  <div class="field"><label>FABRIC FILE &amp; CODE</label><input name="Fabric File & Code" list="fabricList" placeholder="e.g. LEATHER" />' +
-      '    <datalist id="fabricList">' + mFabric().map(function (f) { return '<option value="' + U.esc(f) + '">'; }).join('') + '</datalist></div>' +
-      '  <div class="field"><label>HANDLE TYPE</label><select name="Handle Type"><option value="">— select —</option>' + options(mHandle()) + '</select></div>' +
-      '  <div class="field"><label>ORDERED QTY *</label><input name="Ordered Qty" type="number" min="1" step="1" required placeholder="0" /></div>' +
+      '  <div class="field"><label>PRODUCT IMAGE (link)</label><input name="Product Image" type="url" placeholder="https://drive.google.com/file/d/…" /></div>' +
+      '  <div class="field"><label>PRODUCT QTY *</label><input name="Product Qty" type="number" min="1" step="1" required placeholder="0" /></div>' +
       '  <div class="formactions">' +
       '    <button class="btn btn-primary" type="submit">Save Order</button>' +
       '    <button class="btn" type="reset">Clear</button>' +
@@ -1216,7 +1290,7 @@ window.VIEWS = (function () {
       '</form></div>'
     ));
 
-    /* SPECIFICATION ID is read-only - timestamp is captured when Save Order is clicked. */
+    /* TIMESTAMP is read-only - it is captured when Save Order is clicked. */
     function stamp() {
       var t = new Date(), p = function (x) { return String(x).padStart(2, '0'); };
       return t.getFullYear() + '-' + p(t.getMonth() + 1) + '-' + p(t.getDate()) +
@@ -1232,14 +1306,14 @@ window.VIEWS = (function () {
     root.querySelector('#orderForm').addEventListener('submit', async function (e) {
       e.preventDefault();
       var fd = new FormData(e.target), o = {};
-      fd.forEach(function (v, k) { o[k] = v; });
-      o['Specification ID'] = stamp();   // exact moment the Save Order button was clicked
+      fd.forEach(function (v, k) { o[k] = typeof v === 'string' ? v.trim() : v; });
+      o['Timestamp'] = stamp();   // exact moment the Save Order button was clicked
       var hasBom = ENGINE.bomForOrder(d.bom, o).length > 0;
-      if (!hasBom && !confirm('No BOM found in Kitting Master for this SKU / Model No / Chair Category.\nKitting status will show "No BOM" until you add it.\n\nSave the order anyway?')) return;
+      if (!hasBom && !confirm('No BOM found in Kitting Master for this Product Name / Product Category.\nKitting status will show "No BOM" until you add it.\n\nSave the order anyway?')) return;
       try {
         APP.busy(true);
         var res = await API.createOrder(o);
-        U.toast('Order ' + res.orderId + ' saved to Google Sheets', 'good');
+        U.toast('Order ' + ((res && res.orderId) || o['Order ID'] || '') + ' saved to Google Sheets', 'good');
         e.target.reset();
         await APP.reload();
       } catch (err) { U.toast(err.message, 'bad'); } finally { APP.busy(false); }
@@ -1250,8 +1324,8 @@ window.VIEWS = (function () {
       '<div class="card"><h2>📋 Orders <span class="sub">live from the Orders tab of your Google Sheet — rows added directly in the sheet appear here automatically</span></h2>' +
       '<div class="filters">' +
       '  <div class="field"><label>Status</label><select id="fStatus"><option value="">All</option>' + options(cfg.ORDER_STATUSES) + '</select></div>' +
-      '  <div class="field"><label>Chair Category</label><select id="fCat"><option value="">All</option>' + options(mCat()) + '</select></div>' +
-      '  <div class="field"><label>Chair Type</label><select id="fType"><option value="">All</option>' + options(mType()) + '</select></div>' +
+      '  <div class="field"><label>Product Category</label><select id="fCat"><option value="">All</option>' + options(mCat()) + '</select></div>' +
+      '  <div class="field"><label>Order Type</label><select id="fType"><option value="">All</option>' + options(mType()) + '</select></div>' +
       '  <button class="btn btn-sm" id="fClear">Clear filters</button>' +
       '  <span class="spacer"></span>' +
       '  <button class="btn btn-sm" id="expOrders">⬇ Excel</button>' +
@@ -1260,38 +1334,33 @@ window.VIEWS = (function () {
     );
     root.appendChild(card);
 
-    var ORDER_COLS = ['Order ID', 'Specification ID', 'Chair Type', 'Chair Category', 'Item Pic', 'SKU', 'Model No', 'Fabric File & Code', 'Handle Type', 'Ordered Qty', 'Order Status'];
-
     function draw() {
       var st = card.querySelector('#fStatus').value,
           cat = card.querySelector('#fCat').value,
           typ = card.querySelector('#fType').value;
       var rows = d.orders.filter(function (o) {
-        if (st && o['Order Status'] !== st) return false;
-        if (cat && o['Chair Category'] !== cat) return false;
-        if (typ && o['Chair Type'] !== typ) return false;
-        return matchesSearch(o, ['Order ID', 'Specification ID', 'Chair Type', 'Chair Category', 'Model No', 'SKU', 'Fabric File & Code', 'Handle Type', 'Order Status']);
+        if (st && String(o['Order Status'] || 'Open') !== st) return false;
+        if (cat && o['Product Category'] !== cat) return false;
+        if (typ && o['Order Type'] !== typ) return false;
+        return matchesSearch(o, ['Order ID', 'Timestamp', 'Order Type', 'Product Category', 'Product Name', 'Order Status']);
       });
       var wrap = card.querySelector('#ordersTableWrap');
       if (!rows.length) { wrap.innerHTML = '<div class="empty">No orders found. Create one above, or add rows directly in the Orders tab of your Google Sheet.</div>'; return; }
       wrap.innerHTML =
         '<table class="tbl"><thead><tr>' +
-        '<th data-sort>Order ID</th><th data-sort>Specification ID</th><th data-sort>Chair Type</th>' +
-        '<th data-sort>Chair Category</th><th data-sort>Item Pic</th><th data-sort>SKU</th><th data-sort>Model No</th>' +
-        '<th data-sort>Fabric File &amp; Code</th><th data-sort>Handle Type</th><th data-sort class="num">Ordered Qty</th>' +
-        '<th data-sort>Status</th><th></th></tr></thead><tbody>' +
+        '<th data-sort>Timestamp</th><th data-sort>Order ID</th><th data-sort>Order Type</th>' +
+        '<th data-sort>Product Category</th><th>Product Image</th><th data-sort>Product Name</th>' +
+        '<th data-sort class="num">Product Qty</th><th data-sort>Status</th><th></th></tr></thead><tbody>' +
         rows.map(function (o) {
+          var img = String(o['Product Image'] || '').trim();
           return '<tr>' +
+            '<td class="small">' + U.esc(o['Timestamp'] || '') + '</td>' +
             '<td><b>' + U.esc(o['Order ID']) + '</b></td>' +
-            '<td class="small">' + U.esc(o['Specification ID'] || '') + '</td>' +
-            '<td class="small">' + U.esc(o['Chair Type'] || '') + '</td>' +
-            '<td>' + U.esc(o['Chair Category'] || '') + '</td>' +
-            '<td class="small">' + U.esc(o['Item Pic'] || '') + '</td>' +
-            '<td>' + U.esc(o['SKU'] || '') + '</td>' +
-            '<td>' + U.esc(o['Model No'] || '') + '</td>' +
-            '<td class="small">' + U.esc(o['Fabric File & Code'] || '') + '</td>' +
-            '<td class="small">' + U.esc(o['Handle Type'] || '') + '</td>' +
-            '<td class="num">' + U.fmtQty(o['Ordered Qty']) + '</td>' +
+            '<td class="small">' + U.esc(o['Order Type'] || '') + '</td>' +
+            '<td>' + U.esc(o['Product Category'] || '') + '</td>' +
+            '<td class="small" data-img="' + U.esc(img) + '">' + (/^https?:\/\//i.test(img) ? '🖼 image' : U.esc(img)) + '</td>' +
+            '<td>' + U.esc(o['Product Name'] || '') + '</td>' +
+            '<td class="num">' + U.fmtQty(o['Product Qty']) + '</td>' +
             '<td>' + U.orderStatusPill(String(o['Order Status'] || 'Open')) + '</td>' +
             '<td class="rowactions">' +
             '  <button class="btn btn-sm" disabled title="Editing is disabled - orders are managed in the Google Sheet" style="opacity:.4;cursor:not-allowed">✏️</button> ' +
@@ -1299,17 +1368,6 @@ window.VIEWS = (function () {
             '</td></tr>';
         }).join('') + '</tbody></table>';
       makeSortable(wrap.querySelector('table'));
-
-      wrap.querySelectorAll('[data-edit]').forEach(function (b) {
-        b.onclick = function () { editOrderModal(Number(b.dataset.edit)); };
-      });
-      wrap.querySelectorAll('[data-del]').forEach(function (b) {
-        b.onclick = async function () {
-          if (!confirm('Delete this item line of order ' + b.dataset.oid + '? This cannot be undone.')) return;
-          try { APP.busy(true); await API.deleteOrderRow(Number(b.dataset.del)); U.toast('Order line deleted', 'good'); await APP.reload(); }
-          catch (err) { U.toast(err.message, 'bad'); } finally { APP.busy(false); }
-        };
-      });
     }
     ['fStatus', 'fCat', 'fType'].forEach(function (id) { card.querySelector('#' + id).addEventListener('change', draw); });
     card.querySelector('#fClear').onclick = function () {
@@ -1327,20 +1385,18 @@ window.VIEWS = (function () {
     APP.onSearch(draw);
   }
 
+  /* Not reachable from the UI (order editing is done in the Google Sheet); kept for API parity. */
   function editOrderModal(rowNum) {
     var o = D().orders.find(function (x) { return Number(x._row) === Number(rowNum); });
     if (!o) return;
     openModal('Edit Order — ' + o['Order ID'] + ' (' + ENGINE.orderLabel(o) + ')',
       '<form class="frm" id="editOrderForm">' +
-      '  <div class="field"><label>SPECIFICATION ID</label><input name="Specification ID" value="' + U.esc(o['Specification ID'] || '') + '"/></div>' +
-      '  <div class="field"><label>CHAIR TYPE</label><select name="Chair Type"><option value="">—</option>' + options(mType(), o['Chair Type']) + '</select></div>' +
-      '  <div class="field"><label>CHAIR CATEGORY</label><select name="Chair Category"><option value="">—</option>' + options(mCat(), o['Chair Category']) + '</select></div>' +
-      '  <div class="field"><label>ITEM PIC</label><input name="Item Pic" value="' + U.esc(o['Item Pic'] || '') + '"/></div>' +
-      '  <div class="field"><label>SKU</label><input name="SKU" value="' + U.esc(o['SKU'] || '') + '"/></div>' +
-      '  <div class="field"><label>MODEL NO</label><input name="Model No" value="' + U.esc(o['Model No'] || '') + '"/></div>' +
-      '  <div class="field"><label>FABRIC FILE &amp; CODE</label><input name="Fabric File & Code" value="' + U.esc(o['Fabric File & Code'] || '') + '"/></div>' +
-      '  <div class="field"><label>HANDLE TYPE</label><select name="Handle Type"><option value="">—</option>' + options(mHandle(), o['Handle Type']) + '</select></div>' +
-      '  <div class="field"><label>ORDERED QTY</label><input name="Ordered Qty" type="number" min="1" value="' + U.esc(o['Ordered Qty']) + '"/></div>' +
+      '  <div class="field"><label>TIMESTAMP</label><input name="Timestamp" value="' + U.esc(o['Timestamp'] || '') + '"/></div>' +
+      '  <div class="field"><label>ORDER TYPE</label><select name="Order Type"><option value="">—</option>' + options(mType(), o['Order Type']) + '</select></div>' +
+      '  <div class="field"><label>PRODUCT CATEGORY</label><select name="Product Category"><option value="">—</option>' + options(mCat(), o['Product Category']) + '</select></div>' +
+      '  <div class="field"><label>PRODUCT NAME</label><input name="Product Name" value="' + U.esc(o['Product Name'] || '') + '"/></div>' +
+      '  <div class="field"><label>PRODUCT IMAGE</label><input name="Product Image" value="' + U.esc(o['Product Image'] || '') + '"/></div>' +
+      '  <div class="field"><label>PRODUCT QTY</label><input name="Product Qty" type="number" min="1" value="' + U.esc(o['Product Qty']) + '"/></div>' +
       '  <div class="field"><label>Order Status</label><select name="Order Status">' + options(cfg.ORDER_STATUSES, o['Order Status'] || 'Open') + '</select></div>' +
       '</form>',
       '<button class="btn" id="mCancel">Cancel</button><button class="btn btn-primary" id="mSave">Save Changes</button>'
@@ -1796,7 +1852,7 @@ window.VIEWS = (function () {
     var active = ENGINE.activeOrders(d.orders);
 
     var card = el(
-      '<div class="card"><h2>🏭 Finished Goods — Raw Material Requirement <span class="sub">Auto-calculated: Order × Kitting Master</span></h2>' +
+      '<div class="card"><h2>🏭 Finished Goods — Raw Material Requirement <span class="sub">Auto-calculated: Product Qty × Kitting Master (incl. Fabric, Handle and every other BOM line)</span></h2>' +
       '<div class="filters">' +
       '  <div class="field"><label>Order</label><select id="fgOrder"><option value="">All active orders</option>' +
       active.map(function (o) { return '<option value="' + o._row + '">' + U.esc(o['Order ID'] + ' — ' + ENGINE.orderLabel(o)) + '</option>'; }).join('') +
@@ -1823,9 +1879,9 @@ window.VIEWS = (function () {
       body.innerHTML = data.map(function (blk) {
         var o = blk.order;
         var head = '<div class="mt"><b>' + U.esc(o['Order ID']) + '</b> · ' + U.esc(ENGINE.orderLabel(o)) +
-          ' · ' + U.esc(o['Chair Category'] || '') +
-          ' · Qty <b>' + U.fmtQty(o['Ordered Qty']) + '</b></div>';
-        if (!blk.reqs.length) return head + '<div class="notice">No BOM defined for "' + U.esc(ENGINE.orderLabel(o)) + '" (SKU/Model/Category se koi match nahi mila) — add it in the Kitting Master tab.</div>';
+          ' · ' + U.esc(o['Product Category'] || '') +
+          ' · Qty <b>' + U.fmtQty(ENGINE.orderQty(o)) + '</b></div>';
+        if (!blk.reqs.length) return head + '<div class="notice">No BOM defined for "' + U.esc(ENGINE.orderLabel(o)) + '" (Product Name / Product Category se koi match nahi mila) — add it in the Kitting Master tab.</div>';
         var searchRows = blk.reqs.filter(function (r) {
           return matchesSearch({ a: r.materialCode, b: r.materialName, c: r.orderId, d: r.productName }, ['a', 'b', 'c', 'd']);
         });
@@ -1966,7 +2022,7 @@ window.VIEWS = (function () {
 
     var card = el(
       '<div class="card"><h2>✅ Full Kitting Status <span class="sub">Requirement (FG Status) vs Live Inventory — stock order-by-order reserve hota hai</span></h2>' +
-    '<div class="notice">📌 <b>Stock reservation rule:</b> orders ko sequence me (Specification ID date, phir sheet order) check kiya jata hai. Pehle order ke liye raw material live stock se <b>reserve</b> ho jata hai aur sirf bacha hua stock agle order ko milta hai — is liye baad ke orders me shortage aa sakti hai. Har shortage already reserved stock ko ghata kar (<b>net</b>) dikhayi jati hai, is liye Purchase Requirement me wahi final qty aati hai jo aapko mangwani hai.</div>' +
+    '<div class="notice">📌 <b>Stock reservation rule:</b> orders ko sequence me (Timestamp — date + time, phir sheet order) check kiya jata hai. Pehle order ke liye raw material live stock se <b>reserve</b> ho jata hai aur sirf bacha hua stock agle order ko milta hai — is liye baad ke orders me shortage aa sakti hai. Har shortage already reserved stock ko ghata kar (<b>net</b>) dikhayi jati hai, is liye Purchase Requirement me wahi final qty aati hai jo aapko mangwani hai.</div>' +
       '<div class="filters">' +
       '  <div class="field"><label>Show</label><select id="kFilter">' +
       '    <option value="">All active orders</option><option value="PENDING">Pending only</option>' +
@@ -1982,14 +2038,14 @@ window.VIEWS = (function () {
       var f = card.querySelector('#kFilter').value;
       var rows = evals.filter(function (ev) {
         if (f && ev.result.status !== f) return false;
-        return matchesSearch(ev.order, ['Order ID', 'Specification ID', 'Model No', 'SKU', 'Chair Category']);
+        return matchesSearch(ev.order, ['Order ID', 'Timestamp', 'Product Name', 'Product Category']);
       });
       var wrap = card.querySelector('#kWrap');
       if (!rows.length) { wrap.innerHTML = '<div class="empty">Nothing to show.</div>'; return; }
       wrap.innerHTML =
         '<table class="tbl"><thead><tr>' +
         '<th class="num" title="Stock reservation priority - chhota number pehle stock leta hai">#</th>' +
-      '<th>Order ID</th><th>Specification ID</th><th>Chair Category</th><th>Model / SKU</th><th class="num">Qty</th>' +
+      '<th>Order ID</th><th>Timestamp</th><th>Product Category</th><th>Product Name</th><th class="num">Qty</th>' +
         '<th>Material Coverage</th><th class="num">Short Materials</th><th>Kitting Status</th><th></th></tr></thead><tbody>' +
       rows.map(function (ev) {
         var o = ev.order, r = ev.result;
@@ -2008,9 +2064,9 @@ window.VIEWS = (function () {
           actions += ' <button class="btn btn-sm btn-order" data-shortage="' + U.esc(o['Order ID']) + '">🛒 Order Raw Material</button>';
         }
         return '<tr><td class="num muted small" title="Stock reservation priority">' + ev.seq + '</td>' +
-          '<td><b>' + U.esc(o['Order ID']) + '</b></td><td class="small">' + U.esc(o['Specification ID'] || '') + '</td>' +
-          '<td>' + U.esc(o['Chair Category'] || '') + '</td>' +
-          '<td>' + U.esc(ENGINE.orderLabel(o)) + '</td><td class="num">' + U.fmtQty(o['Ordered Qty']) + '</td>' +
+          '<td><b>' + U.esc(o['Order ID']) + '</b></td><td class="small">' + U.esc(o['Timestamp'] || '') + '</td>' +
+          '<td>' + U.esc(o['Product Category'] || '') + '</td>' +
+          '<td>' + U.esc(ENGINE.orderLabel(o)) + '</td><td class="num">' + U.fmtQty(ENGINE.orderQty(o)) + '</td>' +
           '<td>' + meter + '</td><td class="num">' + shortCell + '</td><td>' + statusHTML + '</td>' +
           '<td class="rowactions">' + actions + '</td></tr>';
       }).join('') + '</tbody></table>';
@@ -2022,9 +2078,9 @@ window.VIEWS = (function () {
     card.querySelector('#kExcel').onclick = function () {
       U.exportExcel('Kitting_Status.xlsx', [{
         name: 'Kitting Status',
-        headers: ['Priority #', 'Order ID', 'Specification ID', 'Chair Category', 'Model / SKU', 'Qty', 'Coverage %', 'Short Materials', 'Kitting Status'],
+        headers: ['Priority #', 'Order ID', 'Timestamp', 'Product Category', 'Product Name', 'Qty', 'Coverage %', 'Short Materials', 'Kitting Status'],
         rows: evals.map(function (ev) {
-          return [ev.seq, ev.order['Order ID'], ev.order['Specification ID'], ev.order['Chair Category'], ENGINE.orderLabel(ev.order), ev.order['Ordered Qty'],
+          return [ev.seq, ev.order['Order ID'], ev.order['Timestamp'], ev.order['Product Category'], ENGINE.orderLabel(ev.order), ENGINE.orderQty(ev.order),
             ev.result.coverage,
             (ev.result.status === 'NO_BOM' ? '' : ev.result.shortages.length),
             ev.result.status === 'COMPLETE' ? 'Full Kitting Completed' : ev.result.status === 'PENDING' ? 'Full Kitting Pending' : 'No BOM'];
@@ -2060,7 +2116,7 @@ window.VIEWS = (function () {
       (ev.seq > 1 ? ' — is order se pehle ' + (ev.seq - 1) + ' order apna raw material reserve kar chuke hain.'
                   : ' — ye pehla order hai, ise poora live stock milta hai.') +
       ' <b>Free Stock</b> = is order ki baari par bacha hua stock · <b>Reserved</b> = is order ke liye lock · <b>Shortage</b> = jo abhi kharidni hai.</div>';
-    openModal('Kitting Detail — ' + o['Order ID'] + ' (' + ENGINE.orderLabel(o) + ' × ' + U.fmtQty(o['Ordered Qty']) + ')',
+    openModal('Kitting Detail — ' + o['Order ID'] + ' (' + ENGINE.orderLabel(o) + ' × ' + U.fmtQty(ENGINE.orderQty(o)) + ')',
       (r.status === 'NO_BOM' ? '<div class="notice">No BOM defined for this product.</div>' :
         intro +
         '<div class="tablewrap"><table class="tbl"><thead><tr>' +
@@ -2733,10 +2789,12 @@ window.APP = (function () {
         scales: { x: { beginAtZero: true, grid: { color: t.grid } }, y: { grid: { display: false } } } }
     });
 
-    // Monthly trend — line (month parsed from Specification ID: dd/MM/yyyy HH:mm:ss)
+    // Monthly trend — line (month taken from the order Timestamp; all date formats)
     function orderMonthKey(o) {
-      var m = /(\d{2})\/(\d{2})\/(\d{4})/.exec(String(o['Specification ID'] || ''));
-      return m ? (m[3] + '-' + m[2]) : '';
+      var ms = ENGINE.orderDateMs(o);
+      if (isNaN(ms)) return '';
+      var dt = new Date(ms);
+      return dt.getFullYear() + '-' + ('0' + (dt.getMonth() + 1)).slice(-2);
     }
     var months = [], counts = [];
     for (var i = 5; i >= 0; i--) {
@@ -2760,14 +2818,14 @@ window.APP = (function () {
     root.insertAdjacentHTML('beforeend',
       '<div class="card"><h2>🕘 Recent Orders</h2><div class="tablewrap">' +
       (!recent.length ? '<div class="empty">No active orders.</div>' :
-        '<table class="tbl"><thead><tr><th>Order</th><th>Specification ID</th><th>Chair Category</th><th>Model / SKU</th><th class="num">Qty</th><th>Kitting</th></tr></thead><tbody>' +
+        '<table class="tbl"><thead><tr><th>Order</th><th>Timestamp</th><th>Product Category</th><th>Product Name</th><th class="num">Qty</th><th>Kitting</th></tr></thead><tbody>' +
         recent.map(function (o) {
           var r = evMap[o._row] || { status: 'NO_BOM' };
           var kit = r.status === 'COMPLETE' ? '<span class="kit-complete">✔ Completed</span>'
             : r.status === 'PENDING' ? '<span class="kit-pending">✖ Pending</span>' : '<span class="muted">No BOM</span>';
-          return '<tr><td><b>' + U.esc(o['Order ID']) + '</b></td><td class="small">' + U.esc(o['Specification ID'] || '') + '</td>' +
-            '<td>' + U.esc(o['Chair Category'] || '') + '</td>' +
-            '<td>' + U.esc(ENGINE.orderLabel(o)) + '</td><td class="num">' + U.fmtQty(o['Ordered Qty']) + '</td>' +
+          return '<tr><td><b>' + U.esc(o['Order ID']) + '</b></td><td class="small">' + U.esc(o['Timestamp'] || '') + '</td>' +
+            '<td>' + U.esc(o['Product Category'] || '') + '</td>' +
+            '<td>' + U.esc(ENGINE.orderLabel(o)) + '</td><td class="num">' + U.fmtQty(ENGINE.orderQty(o)) + '</td>' +
             '<td>' + kit + '</td></tr>';
         }).join('') + '</tbody></table>') +
       '</div></div>');
@@ -2786,9 +2844,9 @@ window.APP = (function () {
     d.orders.forEach(function (o) {
       var k = ENGINE.orderLabel(o);
       if (!k || k === '—') return;
-      if (!prodAgg[k]) prodAgg[k] = { product: k, category: o['Chair Category'] || '', orders: 0, qty: 0 };
+      if (!prodAgg[k]) prodAgg[k] = { product: k, category: o['Product Category'] || '', orders: 0, qty: 0 };
       prodAgg[k].orders++;
-      prodAgg[k].qty += U.num(o['Ordered Qty']);
+      prodAgg[k].qty += ENGINE.orderQty(o);
     });
     var prodRows = Object.keys(prodAgg).map(function (k) { return prodAgg[k]; })
       .sort(function (a, b) { return b.qty - a.qty; });
@@ -2985,7 +3043,7 @@ window.APP = (function () {
   return { state: state, reload: reload, busy: busy, onSearch: onSearch, navigate: navigate };
 })();
 
-  /* ---------- ORDER FORM UI: Manual Order button + Order ID drilldown + Item Pic images ---------- */
+  /* ---------- ORDER FORM UI: Manual Order button + Order ID drilldown + Product Image thumbnails ---------- */
   (function () {
     if (typeof VIEWS === 'undefined' || !VIEWS || VIEWS.__oakOrdersUI) return;
     VIEWS.__oakOrdersUI = true;
@@ -2997,25 +3055,17 @@ window.APP = (function () {
 
     function clearNode(node) { while (node.firstChild) node.removeChild(node.firstChild); }
 
-    function driveId(v) {
-      var m = String(v || '').match(/[-\w]{25,}/);
-      return m ? m[0] : '';
+    /* Product Image column holds the image link (Google Drive share link, Drive
+       file id, or any direct https image URL). */
+    function imgSrc(v, size) {
+      var t = String(v == null ? '' : v).trim();
+      if (!t) return '';
+      var m = t.match(/[?&]id=([-\w]{20,})/) || t.match(/\/d\/([-\w]{20,})/) || t.match(/^([-\w]{25,})$/);
+      if (m) return DRIVE_THUMB + m[1] + '&sz=' + size;
+      return /^https?:\/\//i.test(t) ? t : '';
     }
 
-    function picMap() {
-      var m = {};
-      try {
-        var arr = (APP && APP.state && APP.state.data && APP.state.data.orders) || [];
-        for (var i = 0; i < arr.length; i++) {
-          var nm = String(arr[i]['ITEM PIC'] || arr[i]['Item Pic'] || '').trim();
-          var id = driveId(arr[i]['ITEM PIC URL'] || arr[i]['Item Pic Url'] || '');
-          if (nm && id) m[nm.toLowerCase()] = id;
-        }
-      } catch (e) { }
-      return m;
-    }
-
-    function bigView(id, name) {
+    function bigView(link, name) {
       var ov = document.createElement('div');
       ov.style.position = 'fixed';
       ov.style.left = '0';
@@ -3031,7 +3081,7 @@ window.APP = (function () {
       ov.style.padding = '24px';
       ov.style.cursor = 'zoom-out';
       var im = document.createElement('img');
-      im.src = DRIVE_THUMB + id + '&sz=w1400';
+      im.src = imgSrc(link, 'w1400');
       im.alt = name || '';
       im.style.maxWidth = '92%';
       im.style.maxHeight = '86%';
@@ -3054,21 +3104,20 @@ window.APP = (function () {
       document.body.appendChild(ov);
     }
 
-    function swapPic(tr, idx, map) {
+    function swapPic(tr, idx) {
       if (idx < 0) return;
       var tds = tr.querySelectorAll('td');
       var cell = tds[idx];
       if (!cell || cell.getAttribute('data-oakpic') === '1') return;
-      var name = (cell.textContent || '').trim();
-      if (!name) return;
-      var id = map[name.toLowerCase()];
-      if (!id) return;
+      var link = (cell.getAttribute('data-img') || cell.textContent || '').trim();
+      var src = imgSrc(link, 'w200');
+      if (!src) return;
       cell.setAttribute('data-oakpic', '1');
       clearNode(cell);
       var im = document.createElement('img');
-      im.src = DRIVE_THUMB + id + '&sz=w200';
-      im.alt = name;
-      im.title = name;
+      im.src = src;
+      im.alt = 'Product image';
+      im.title = link;
       im.loading = 'lazy';
       im.style.width = '72px';
       im.style.height = '72px';
@@ -3076,8 +3125,14 @@ window.APP = (function () {
       im.style.borderRadius = '8px';
       im.style.display = 'block';
       im.style.cursor = 'zoom-in';
-      im.onclick = function (ev) { ev.stopPropagation(); bigView(id, name); };
-      im.onerror = function () { clearNode(cell); cell.textContent = name; };
+      im.onclick = function (ev) { ev.stopPropagation(); bigView(link, ''); };
+      im.onerror = function () {
+        clearNode(cell);
+        var a = document.createElement('a');
+        a.href = link; a.target = '_blank'; a.rel = 'noopener'; a.textContent = 'Open image';
+        a.onclick = function (ev) { ev.stopPropagation(); };
+        cell.appendChild(a);
+      };
       cell.appendChild(im);
     }
 
@@ -3122,19 +3177,20 @@ window.APP = (function () {
         busy = true;
         try {
           var headTr = orig.querySelector('thead tr');
-          var picIdx = -1;
+          var picIdx = -1, idIdx = 0;
           if (headTr) {
             var hcells = headTr.querySelectorAll('th');
             for (var hi = 0; hi < hcells.length; hi++) {
-              if ((hcells[hi].textContent || '').trim().toLowerCase() === 'item pic') { picIdx = hi; break; }
+              var ht = (hcells[hi].textContent || '').replace(/[▲▼]/g, '').trim().toLowerCase();
+              if (ht === 'product image') picIdx = hi;
+              if (ht === 'order id') idIdx = hi;
             }
           }
-          var pmap = picMap();
           var bodyRows = Array.prototype.slice.call(orig.querySelectorAll('tbody tr'));
           var groups = [];
           var map = {};
           bodyRows.forEach(function (tr) {
-            var c0 = tr.querySelector('td');
+            var c0 = tr.querySelectorAll('td')[idIdx];
             var key = c0 ? (c0.textContent || '').trim() : '';
             if (!key) key = '(no order id)';
             if (!map[key]) { map[key] = { id: key, rows: [] }; groups.push(map[key]); }
@@ -3187,7 +3243,7 @@ window.APP = (function () {
               if (headTr) ith.appendChild(headTr.cloneNode(true));
               inner.appendChild(ith);
               var itb = document.createElement('tbody');
-              g.rows.forEach(function (r) { swapPic(r, picIdx, pmap); itb.appendChild(r); });
+              g.rows.forEach(function (r) { swapPic(r, picIdx); itb.appendChild(r); });
               inner.appendChild(itb);
               var box = document.createElement('div');
               box.className = 'tablewrap';
